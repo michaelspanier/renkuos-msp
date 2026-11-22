@@ -35,8 +35,8 @@ The older series `build00096-msp2` stays for reference.
 | 34 | boot/loader: prefer a volume marked as the default | [#587](https://github.com/RenkuOS/Source/pull/587) (fixes [#467](https://github.com/RenkuOS/Source/issues/467)) |
 | 35 | power_daemon: save power while the lid is closed (atomozero) | [#530](https://github.com/RenkuOS/Source/pull/530) |
 | 36 | media_server: a default chosen while running is the saved one (atomozero) | [#551](https://github.com/RenkuOS/Source/pull/551) |
-| 37–40 | acpi_battery, PowerStatus, power: ThinkPad charge limit (Full / 80 % / 60 %) | not yet submitted |
-| 41 | acpi_ac: read the AC state when the driver starts (booted on AC showed "offline") | not yet submitted |
+| 37–40 | acpi_battery, PowerStatus, power: ThinkPad charge limit (Full / 80 % / 60 %) | [#601](https://github.com/RenkuOS/Source/pull/601) |
+| 41 | acpi_ac: read the AC state when the driver starts (booted on AC showed "offline") | [#602](https://github.com/RenkuOS/Source/pull/602) |
 | 42 | kernel/debug: time since boot in front of syslog lines, to time the boot | test bench aid, not yet submitted |
 | 43 | usb_webcam: drive only the first video function of a camera (color + IR cameras) | for [#348](https://github.com/RenkuOS/Source/issues/348); build-tested only, no camera with two functions here |
 

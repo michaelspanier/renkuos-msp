@@ -1,0 +1,241 @@
+From c9bc42a978e3d8aea8ffc992fc2323b87acc9503 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:24:40 +0000
+Subject: [PATCH 08/34] usb_webcam: name UVC cameras after their product string
+
+Every UVC camera got the same generic flavor name, so applications
+showed two cameras as the same device. The name is now the product
+string the device reports, for example "Integrated Camera" or
+"HD Pro Webcam C920", without padding and cut to the media name
+length without splitting a UTF-8 character. A device without a
+product string keeps the generic name.
+
+CamDeviceNameTest covers the trimming and cutting.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 8f3c4fc4b94c00f26e3b392ca94d579b74f03ca8)
+---
+ .../media-add-ons/usb_webcam/CamDevice.cpp    | 10 ++
+ .../media-add-ons/usb_webcam/CamDeviceName.h  | 63 ++++++++++++
+ .../media/usb_webcam/CamDeviceNameTest.cpp    | 97 +++++++++++++++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |  1 +
+ 4 files changed, 171 insertions(+)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/CamDeviceName.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/CamDeviceNameTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 0d1322d3b7..09d1106376 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -8,6 +8,7 @@
+ #include "CamSensor.h"
+ #include "CamDeframer.h"
+ #include "CamDebug.h"
++#include "CamDeviceName.h"
+ #include "AddOn.h"
+ 
+ #include <OS.h>
+@@ -61,6 +62,15 @@ CamDevice::CamDevice(CamDeviceAddon &_addon, BUSBDevice* _device)
+ 		fFlavorInfo.name = fFlavorInfoNameStr.String();
+ 		fFlavorInfo.info = fFlavorInfoInfoStr.String();
+ 	}
++
++	// All cameras of one add-on get the same generic name above; the product
++	// string of the device tells them apart, for example "Integrated Camera".
++	char deviceName[B_MEDIA_NAME_LENGTH];
++	if (cam_device_name(deviceName, sizeof(deviceName),
++			_device->ProductString())) {
++		fFlavorInfoNameStr = deviceName;
++		fFlavorInfo.name = fFlavorInfoNameStr.String();
++	}
+ #ifdef DEBUG_WRITE_DUMP
+ 	fDumpFD = open("/boot/home/webcam.out", O_CREAT|O_RDWR, 0644);
+ #endif
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDeviceName.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDeviceName.h
+new file mode 100644
+index 0000000000..6a06a07135
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDeviceName.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef CAM_DEVICE_NAME_H
++#define CAM_DEVICE_NAME_H
++
++
++#include <stddef.h>
++#include <string.h>
++
++
++static inline bool
++cam_is_space(char c)
++{
++	return c == ' ' || c == '\t';
++}
++
++
++//!	A byte that continues a UTF-8 character, which must not be cut off.
++static inline bool
++cam_is_utf8_continuation(char c)
++{
++	return ((unsigned char)c & 0xc0) == 0x80;
++}
++
++
++/*!	Writes the name a camera is shown with: the product string the device
++	reports, without the spaces around it and cut to fit \a size without
++	splitting a character. Returns false and leaves \a buffer alone if the
++	device reports no product string; the caller keeps its generic name then.
++*/
++static inline bool
++cam_device_name(char* buffer, size_t size, const char* product)
++{
++	if (product == NULL || size == 0)
++		return false;
++
++	while (cam_is_space(*product))
++		product++;
++	size_t length = strlen(product);
++	while (length > 0 && cam_is_space(product[length - 1]))
++		length--;
++	if (length == 0)
++		return false;
++
++	if (length > size - 1) {
++		length = size - 1;
++		while (length > 0 && cam_is_utf8_continuation(product[length]))
++			length--;
++		while (length > 0 && cam_is_space(product[length - 1]))
++			length--;
++	}
++
++	memcpy(buffer, product, length);
++	buffer[length] = '\0';
++	return true;
++}
++
++
++#endif	// CAM_DEVICE_NAME_H
+diff --git a/src/tests/add-ons/media/usb_webcam/CamDeviceNameTest.cpp b/src/tests/add-ons/media/usb_webcam/CamDeviceNameTest.cpp
+new file mode 100644
+index 0000000000..bdf01bdd26
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/CamDeviceNameTest.cpp
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "CamDeviceName.h"
++
++#include <stdio.h>
++#include <string.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_product_string_is_the_name()
++{
++	char name[64];
++	CHECK(cam_device_name(name, sizeof(name), "Integrated Camera"));
++	CHECK(strcmp(name, "Integrated Camera") == 0);
++}
++
++
++static void
++test_spaces_around_the_product_string_are_dropped()
++{
++	// Some devices pad their strings.
++	char name[64];
++	CHECK(cam_device_name(name, sizeof(name), "  HD Pro Webcam C920  "));
++	CHECK(strcmp(name, "HD Pro Webcam C920") == 0);
++}
++
++
++static void
++test_missing_or_empty_product_string_gives_no_name()
++{
++	char name[64] = "unchanged";
++	CHECK(!cam_device_name(name, sizeof(name), NULL));
++	CHECK(!cam_device_name(name, sizeof(name), ""));
++	CHECK(!cam_device_name(name, sizeof(name), "   "));
++	CHECK(strcmp(name, "unchanged") == 0);
++}
++
++
++static void
++test_long_name_is_cut_to_the_buffer()
++{
++	char name[8];
++	CHECK(cam_device_name(name, sizeof(name), "Integrated Camera"));
++	CHECK(strcmp(name, "Integra") == 0);
++}
++
++
++static void
++test_cut_does_not_split_a_character()
++{
++	// "Kamera ä" with a two-byte ä: seven bytes fit, the ä would be split.
++	char name[9];
++	CHECK(cam_device_name(name, sizeof(name), "Kamera \xc3\xa4x"));
++	CHECK(strcmp(name, "Kamera") == 0);
++}
++
++
++#define RUN(test) \
++	do { \
++		int before = sFailures; \
++		test(); \
++		sTests++; \
++		printf("%s %s\n", sFailures == before ? "ok  " : "FAIL", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_product_string_is_the_name);
++	RUN(test_spaces_around_the_product_string_are_dropped);
++	RUN(test_missing_or_empty_product_string_gives_no_name);
++	RUN(test_long_name_is_cut_to_the_buffer);
++	RUN(test_cut_does_not_split_a_character);
++
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index e38ab34e55..81cf331730 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src tests add-ons media usb_webcam ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
+ 
++SimpleTest CamDeviceNameTest : CamDeviceNameTest.cpp ;
+ SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
+ SimpleTest UVCColorTest : UVCColorTest.cpp ;
+ SimpleTest UVCFrameBufferTest : UVCFrameBufferTest.cpp ;
+-- 
+2.54.1
+

@@ -1,0 +1,74 @@
+From d0262902cd41070f315e317a6745d3660522cdd5 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 10:32:44 +0000
+Subject: [PATCH 25/34] libmedia: do not use a deleted time source in
+ BMediaEventLooper
+
+msp: from HaikiDevKI's patch 5-libmedia.patch, not in any PR.
+---
+ src/kits/media/MediaEventLooper.cpp | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/kits/media/MediaEventLooper.cpp b/src/kits/media/MediaEventLooper.cpp
+index 0ea6c2f41e..1cc6c05cbb 100644
+--- a/src/kits/media/MediaEventLooper.cpp
++++ b/src/kits/media/MediaEventLooper.cpp
+@@ -35,6 +35,28 @@
+ #include <ServerInterface.h>
+ #include "MediaDebug.h"
+ 
++
++// TimeSource() returns NULL when a node never created its time source object
++// and the media server is already gone: that is how an idle node meets the
++// add-on server's StopNode() at shutdown. Without a time source there is no
++// performance time to wait for, so such events are due now.
++static bigtime_t
++real_time_now(BTimeSource* timeSource)
++{
++	return timeSource != NULL ? timeSource->RealTime() : system_time();
++}
++
++
++static bigtime_t
++real_time_for(BTimeSource* timeSource, bigtime_t performanceTime,
++	bigtime_t latency)
++{
++	if (timeSource == NULL)
++		return system_time();
++	return timeSource->RealTimeFor(performanceTime, latency);
++}
++
++
+ /*************************************************************
+  * protected BMediaEventLooper
+  *************************************************************/
+@@ -240,7 +262,7 @@ BMediaEventLooper::ControlLoop()
+ 				// The general idea of lateness is to allow
+ 				// the client code to detect when the buffer
+ 				// is handled late or early.
+-				bigtime_t lateness = TimeSource()->RealTime() - waitUntil;
++				bigtime_t lateness = real_time_now(TimeSource()) - waitUntil;
+ 
+ 				DispatchEvent(&event, lateness, hasRealtime);
+ 			}
+@@ -255,7 +277,7 @@ BMediaEventLooper::ControlLoop()
+ 		hasEvent = fEventQueue.HasEvents();
+ 
+ 		if (hasEvent) {
+-			waitUntil = TimeSource()->RealTimeFor(
++			waitUntil = real_time_for(TimeSource(),
+ 				fEventQueue.FirstEventTime(),
+ 				fEventLatency + fSchedulingLatency);
+ 		} else if (!hasRealtime)
+@@ -273,7 +295,7 @@ BMediaEventLooper::ControlLoop()
+ 		}
+ 
+ 		if (waitUntil != B_INFINITE_TIMEOUT
+-				&& TimeSource()->RealTime() >= waitUntil) {
++				&& real_time_now(TimeSource()) >= waitUntil) {
+ 			err = WaitForMessage(0);
+ 		} else
+ 			err = WaitForMessage(waitUntil);
+-- 
+2.54.1
+

@@ -1,0 +1,173 @@
+From b87964ccae22fb3b71d8588082027be8e709a8ed Mon Sep 17 00:00:00 2001
+From: Dru Satori <dru@druware.com>
+Date: Mon, 16 Nov 2026 17:42:17 -0500
+Subject: [PATCH 19/34] Network, NetworkStatus: show one entry per SSID
+
+The Network preferences and the Deskbar NetworkStatus menu list one
+item per access point, so a mesh or a multi-AP network shows the same
+name several times, with no way to tell the entries apart.
+
+Collapse the scan list to one entry per SSID before building the menu,
+keeping the strongest access point of each (new
+WirelessNetworkMenuItem::MergeSameName()). Hidden networks (no SSID)
+stay one per BSSID. An entry is marked if any of its access points is
+associated. In the preferences, items are matched by SSID and the join
+message is updated to the group's current strongest access point.
+
+Assisted-by: Claude Opus 5.5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Dru Satori <dru@druware.com>
+(cherry picked from commit 19ee32ee04071f9ba70b10fdc5dbe7aa72805f31)
+---
+ src/apps/networkstatus/NetworkStatusView.cpp  |  2 +
+ .../networkstatus/WirelessNetworkMenuItem.cpp | 40 +++++++++++++++++++
+ .../networkstatus/WirelessNetworkMenuItem.h   |  5 +++
+ src/preferences/network/InterfaceView.cpp     | 24 +++++++++--
+ 4 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/src/apps/networkstatus/NetworkStatusView.cpp b/src/apps/networkstatus/NetworkStatusView.cpp
+index 9b825851b7..e3dce1ac2b 100644
+--- a/src/apps/networkstatus/NetworkStatusView.cpp
++++ b/src/apps/networkstatus/NetworkStatusView.cpp
+@@ -410,6 +410,8 @@ NetworkStatusView::MouseDown(BPoint point)
+ 		uint32 networksCount = 0;
+ 		wireless_network* networks = NULL;
+ 		device.GetNetworks(networks, networksCount);
++		networksCount = WirelessNetworkMenuItem::MergeSameName(networks,
++			networksCount, associated);
+ 		for (uint32 i = 0; i < networksCount; i++) {
+ 			const wireless_network& network = networks[i];
+ 			BMessage* message = new BMessage(kMsgJoinNetwork);
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+index c0c49e5ea9..b085f1607e 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+@@ -122,3 +122,43 @@ WirelessNetworkMenuItem::CompareSignalStrength(const BMenuItem* a,
+ 
+ 	return bNetwork.signal_strength - aNetwork.signal_strength;
+ }
++
++
++/*!	Collapses \a networks in place to one entry per SSID, keeping the
++	strongest access point of each. Hidden networks (empty name) are kept
++	as they are. If any access point of a group is in \a associated, the
++	address of the kept entry is added to it, so the entry can be marked.
++	Returns the new number of entries.
++*/
++/*static*/ uint32
++WirelessNetworkMenuItem::MergeSameName(wireless_network* networks,
++	uint32 count, std::set<BNetworkAddress>& associated)
++{
++	uint32 merged = 0;
++	for (uint32 i = 0; i < count; i++) {
++		const wireless_network network = networks[i];
++
++		uint32 group = merged;
++		if (network.name[0] != '\0') {
++			for (group = 0; group < merged; group++) {
++				if (strcmp(networks[group].name, network.name) == 0)
++					break;
++			}
++		}
++
++		if (group == merged) {
++			networks[merged++] = network;
++			continue;
++		}
++
++		bool isAssociated
++			= associated.find(network.address) != associated.end()
++			|| associated.find(networks[group].address) != associated.end();
++		if (network.signal_strength > networks[group].signal_strength)
++			networks[group] = network;
++		if (isAssociated)
++			associated.insert(networks[group].address);
++	}
++
++	return merged;
++}
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.h b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+index 07373e6327..55e3cf6e4f 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.h
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+@@ -6,6 +6,8 @@
+ #define WIRELESS_NETWORK_MENU_ITEM_H
+ 
+ 
++#include <set>
++
+ #include <MenuItem.h>
+ #include <NetworkDevice.h>
+ 
+@@ -24,6 +26,9 @@ public:
+ 
+ 	static	int					CompareSignalStrength(const BMenuItem* a,
+ 									const BMenuItem* b);
++	static	uint32				MergeSameName(wireless_network* networks,
++									uint32 count,
++									std::set<BNetworkAddress>& associated);
+ 
+ protected:
+ 	virtual	void				DrawContent();
+diff --git a/src/preferences/network/InterfaceView.cpp b/src/preferences/network/InterfaceView.cpp
+index 09b99134d3..e7cfdc5e66 100644
+--- a/src/preferences/network/InterfaceView.cpp
++++ b/src/preferences/network/InterfaceView.cpp
+@@ -34,6 +34,19 @@ static const uint32 kMsgInterfaceRenegotiate = 'redo';
+ static const uint32 kMsgJoinNetwork = 'join';
+ 
+ 
++/*!	Match by SSID (BSSID only for hidden networks), not
++	wireless_network::operator==, which also compares the ever-changing
++	signal strength. Access points sharing an SSID are one menu entry.
++*/
++static bool
++same_network(const wireless_network& a, const wireless_network& b)
++{
++	if (a.name[0] == '\0' && b.name[0] == '\0')
++		return a.address == b.address;
++	return strcmp(a.name, b.name) == 0;
++}
++
++
+ #undef B_TRANSLATION_CONTEXT
+ #define B_TRANSLATION_CONTEXT "IntefaceView"
+ 
+@@ -294,6 +307,8 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 		}
+ 
+ 		ArrayDeleter<wireless_network> networksDeleter(networks);
++		networksCount = WirelessNetworkMenuItem::MergeSameName(networks,
++			networksCount, associated);
+ 
+ 		// go through menu items and remove networks that have dropped out
+ 		for (int32 index = 0; index < count; index++) {
+@@ -305,9 +320,7 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 
+ 			bool networkFound = false;
+ 			for (uint32 i = 0; i < networksCount; i++) {
+-				// Not operator==, which also compares the ever-changing
+-				// signal strength.
+-				if (networkItem->Network().address == networks[i].address) {
++				if (same_network(networkItem->Network(), networks[i])) {
+ 					networkFound = true;
+ 					break;
+ 				}
+@@ -333,10 +346,13 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 				if (networkItem == NULL)
+ 					break;
+ 
+-				if (networkItem->Network().address == network.address) {
++				if (same_network(networkItem->Network(), network)) {
+ 					// found it, refresh signal/label in place
+ 					networkFound = true;
+ 					networkItem->SetNetwork(network);
++					// join the group's current strongest AP
++					BNetworkAddress address = network.address;
++					networkItem->Message()->ReplaceFlat("address", &address);
+ 					if (associated.find(network.address) != associated.end())
+ 						networkItem->SetMarked(true);
+ 					break;
+-- 
+2.54.1
+

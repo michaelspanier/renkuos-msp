@@ -1,0 +1,230 @@
+From 72774d55fdea71b1d5a34970fd377eb0460e31de Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 17:28:44 +0000
+Subject: [PATCH 32/34] net80211: treat an AP below -75 dBm as weak
+
+The walk the roaming tests replay was logged from "ifconfig list",
+which shows half of ni_rssi. With the real values the series start
+around 52 to 62 and are far above the scan threshold while standing,
+and the "weak" threshold of 30 % (-80 dBm) came too late: on the
+stairs to the cellar the old AP sat at -72 to -78 dBm against a
+candidate at -40 dBm for several scans, waiting for the second scan
+to confirm.
+
+Call an AP weak below -75 dBm (38 % of the iwm scale), where 5 GHz
+throughput is low anyway and roaming stacks commonly start to look
+for a better AP. The lost threshold of -87 dBm stays.
+
+The replay tests now double the logged values, use the 5 GHz scan
+threshold and start a new average on joining, as the kernel does.
+The noise simulations moved from 26 to 30, below the threshold,
+because at the real 52 no scan would happen at all. A weak office
+with outlier beacons is simulated as well.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ .../openbsd_wlan/net80211/ieee80211_node.c    |  4 +-
+ .../compat/openbsd_wlan/roam_logic_test.c     | 82 ++++++++++++++-----
+ 2 files changed, 64 insertions(+), 22 deletions(-)
+
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+index 11d5d3101f..727a638942 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+@@ -1348,8 +1348,8 @@ ieee80211_node_switch_bss(struct ieee80211com *ic, struct ieee80211_node *ni)
+  */
+ #define IEEE80211_ROAM_LOST_RATIO	20	/* in percent */
+ #define IEEE80211_ROAM_LOST		(-85)	/* in dBm */
+-#define IEEE80211_ROAM_WEAK_RATIO	30	/* in percent */
+-#define IEEE80211_ROAM_WEAK		(-80)	/* in dBm */
++#define IEEE80211_ROAM_WEAK_RATIO	38	/* in percent, -75 dBm on iwm */
++#define IEEE80211_ROAM_WEAK		(-75)	/* in dBm */
+ #define IEEE80211_ROAM_HYSTERESIS	8	/* about dB */
+ #define IEEE80211_ROAM_HYST_FAST	15	/* about dB */
+ #define IEEE80211_ROAM_DWELL		30000	/* msec */
+diff --git a/src/tests/libs/compat/openbsd_wlan/roam_logic_test.c b/src/tests/libs/compat/openbsd_wlan/roam_logic_test.c
+index 0310dc4130..92dfb099a1 100644
+--- a/src/tests/libs/compat/openbsd_wlan/roam_logic_test.c
++++ b/src/tests/libs/compat/openbsd_wlan/roam_logic_test.c
+@@ -37,7 +37,7 @@ static const struct ieee80211_roam_params kParams = {
+ 	30000,		/* rp_dwell */
+ 	5000,		/* rp_scan_min */
+ 	60000,		/* rp_scan_max */
+-	20,		/* rp_weak_thres, 30 % */
++	25,		/* rp_weak_thres, -75 dBm */
+ 	15,		/* rp_hyst_fast */
+ 	2500,		/* rp_scan_weak */
+ 	1000,		/* rp_scan_lost */
+@@ -653,7 +653,12 @@ simulate(struct sim* sim, long long from, long long to)
+ static int
+ level_equal(int ap, long long t)
+ {
+-	return 26;
++	/*
++	 * bb:80 and bb:7f measured 52 each, far above the threshold, where
++	 * no scan happens at all. 30 is below it, where every scan is a
++	 * chance to switch.
++	 */
++	return 30;
+ }
+ 
+ 
+@@ -662,7 +667,7 @@ test_sim_equal_with_noise(void)
+ {
+ 	struct sim sim = { level_equal, 2, 0 };
+ 
+-	/* Like bb:80 and bb:7f: both 26, noise +-3, for 20 minutes. */
++	/* Like bb:80 and bb:7f: equal, noise +-3, for 20 minutes. */
+ 	simulate(&sim, kStart, kStart + SEC(1200));
+ 	printf("  equal: %d scans, %d switches\n", sim.scans, sim.switches);
+ 	CHECK(sim.switches == 0);
+@@ -674,7 +679,7 @@ static int
+ level_mesh(int ap, long long t)
+ {
+ 	/* Four APs within 3 units of each other, like the Fritz mesh. */
+-	static const int kLevel[] = { 24, 26, 25, 23 };
++	static const int kLevel[] = { 30, 32, 31, 29 };
+ 	return kLevel[ap];
+ }
+ 
+@@ -706,13 +711,23 @@ test_sim_equal_with_outliers(void)
+ static int
+ level_office(int ap, long long t)
+ {
+-	/* The office in the OG: every AP is weak. */
++	/* The office in the OG: every AP is lost or nearly. */
+ 	static const int kLevels[] = { 11, 12, 10 };
+ 
+ 	return kLevels[ap];
+ }
+ 
+ 
++static int
++level_office_weak(int ap, long long t)
++{
++	/* Or merely weak, -75 to -80 dBm. */
++	static const int kLevels[] = { 22, 24, 20 };
++
++	return kLevels[ap];
++}
++
++
+ static void
+ test_sim_office_all_weak(void)
+ {
+@@ -724,6 +739,22 @@ test_sim_office_all_weak(void)
+ 	CHECK(sim.switches <= 3);
+ 	/* Not a scan storm either: one per rp_scan_still at most. */
+ 	CHECK(sim.scans <= 600 / 10 + 5);
++
++	struct sim weak = { level_office_weak, 3, 0 };
++
++	simulate(&weak, kStart, kStart + SEC(600));
++	printf("  office, weak: %d scans, %d switches\n", weak.scans,
++		weak.switches);
++	CHECK(weak.switches <= 3);
++	CHECK(weak.scans <= 600 / 10 + 5);
++
++	struct sim spikes = { level_office_weak, 3, 0 };
++
++	spikes.spikes = 1;
++	simulate(&spikes, kStart, kStart + SEC(600));
++	printf("  office, weak, outliers: %d scans, %d switches\n",
++		spikes.scans, spikes.switches);
++	CHECK(spikes.switches <= 3);
+ }
+ 
+ 
+@@ -816,7 +847,8 @@ test_sim_current_vanishes(void)
+  * The signal of the current AP, one value per second, as wlan.log of
+  * the walk with the first roaming driver recorded it (messung/
+  * rundgang-20261122-180551). Candidates are what the scans showed
+- * afterwards.
++ * afterwards. The log took the values from "ifconfig list", which
++ * shows half of ni_rssi: replay() doubles them.
+  */
+ 
+ /* bb:7f, stairs EG -> KG from 18:06:50. Switched at 18:07:40 (50). */
+@@ -847,6 +879,12 @@ static const int kLeavingOg[] = {
+ 
+ #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+ #define REPLAY_SCAN 4000	/* msec, one background scan of the iwm */
++#define REPLAY_SCALE 2		/* "ifconfig list" shows half the RSSI */
++
++/* The APs of the walk are 5 GHz ones: scan below 50 % of 67. */
++static const struct ieee80211_roam_params kParams5 = {
++	33, 13, 8, 30000, 5000, 60000, 25, 15, 2500, 1000, 10000
++};
+ 
+ struct replay {
+ 	const int*	cur;		/* current AP, one value per second */
+@@ -860,9 +898,9 @@ struct replay {
+ 
+ 
+ /*
+- * Ten minutes of standing still at 28 first, so that the backoff is at
+- * its top, as it was in the EG. Then the series: a frame every 100 ms,
+- * scans take REPLAY_SCAN, the decision comes at the end of the scan.
++ * Ten minutes of standing still at 56 first, as in the EG. Then the
++ * series: a frame every 100 ms, scans take REPLAY_SCAN, the decision
++ * comes at the end of the scan.
+  */
+ static void
+ replay(struct replay* r)
+@@ -876,37 +914,41 @@ replay(struct replay* r)
+ 	memset(&avg, 0, sizeof(avg));
+ 	sSeed = 7;
+ 	for (; now < kStart + SEC(600); now += 100) {
+-		ieee80211_roam_avg_add(&avg, 28 + noise() / 2, now);
++		ieee80211_roam_avg_add(&avg, 56 + noise(), now);
+ 		int cur = ieee80211_roam_avg_get(&avg);
+-		if (ieee80211_roam_should_scan(&kParams, &state, cur, now)) {
+-			ieee80211_roam_should_switch(&kParams, &state, cur, 0, 0,
++		if (ieee80211_roam_should_scan(&kParams5, &state, cur, now)) {
++			ieee80211_roam_should_switch(&kParams5, &state, cur, 0, 0,
+ 				now);
+-			ieee80211_roam_scan_done(&kParams, &state);
++			ieee80211_roam_scan_done(&kParams5, &state);
+ 		}
+ 	}
+ 
+ 	from = now;
+-	if (r->joined != 0)
+-		ieee80211_roam_joined(&kParams, &state, from - SEC(r->joined));
++	if (r->joined != 0) {
++		/* As ieee80211_roam_join(): a new AP, a new average. */
++		ieee80211_roam_joined(&kParams5, &state, from - SEC(r->joined));
++		memset(&avg, 0, sizeof(avg));
++	}
+ 	r->switched = -1;
+ 	for (; now < from + SEC(r->seconds); now += 100) {
+ 		int second = (int)((now - from) / 1000);
+ 		int cur;
+ 
+-		ieee80211_roam_avg_add(&avg, r->cur[second] + noise() / 2, now);
++		ieee80211_roam_avg_add(&avg,
++		    REPLAY_SCALE * r->cur[second] + noise(), now);
+ 		cur = ieee80211_roam_avg_get(&avg);
+ 		if (scanEnd != 0) {
+ 			if (now < scanEnd)
+ 				continue;
+ 			scanEnd = 0;
+-			if (ieee80211_roam_should_switch(&kParams, &state, cur,
+-					r->cand(second), 2, now)) {
++			if (ieee80211_roam_should_switch(&kParams5, &state, cur,
++					REPLAY_SCALE * r->cand(second), 2, now)) {
+ 				r->switched = second;
+ 				return;
+ 			}
+-			ieee80211_roam_scan_done(&kParams, &state);
++			ieee80211_roam_scan_done(&kParams5, &state);
+ 		}
+-		if (!ieee80211_roam_should_scan(&kParams, &state, cur, now))
++		if (!ieee80211_roam_should_scan(&kParams5, &state, cur, now))
+ 			continue;
+ 		if (r->refuse && requests++ % 2 == 0) {
+ 			ieee80211_roam_scan_refused(&state, now);
+-- 
+2.54.1
+

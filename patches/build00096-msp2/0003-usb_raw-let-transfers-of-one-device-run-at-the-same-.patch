@@ -1,0 +1,176 @@
+From 91906fc720029db8aefafcc04535d33e2a43e2c4 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Fri, 20 Nov 2026 07:12:32 +0000
+Subject: [PATCH 03/34] usb_raw: let transfers of one device run at the same
+ time
+
+Interrupt, bulk and isochronous transfers kept the device lock and the
+device's single semaphore and status until the transfer finished. A
+second transfer on the same device had to wait, so a stream could not
+keep a transfer queued while the previous one was handed over, and
+isochronous packets got lost in between.
+
+Give every transfer its own semaphore, status and length, and hold the
+device lock only while queueing. When a waiting thread is interrupted,
+it cancels the endpoint's transfers only if its own transfer has not
+finished yet, and always waits for its callback before returning.
+
+Control transfers keep the old path. Both callbacks now share
+raw_status_for().
+
+Cancelling still cancels all queued transfers of the endpoint, also
+those of other threads; they return B_USB_RAW_STATUS_ABORTED.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 8eb441b9fad7c2313366d6846a04ee291872bfbe)
+---
+ .../kernel/drivers/bus/usb/usb_raw.cpp        | 91 +++++++++++++------
+ 1 file changed, 65 insertions(+), 26 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index 517985ef2d..d6dbd7503e 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -247,33 +247,50 @@ usb_raw_free(void *cookie)
+ }
+ 
+ 
+-static void
+-usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
+-{
+-	TRACE((DRIVER_NAME": callback()\n"));
+-	raw_device *device = (raw_device *)cookie;
++typedef struct {
++	sem_id				notify;
++	status_t			status;
++	size_t				actual_length;
++} raw_transfer;
++
+ 
++static int32
++raw_status_for(status_t status)
++{
+ 	switch (status) {
+ 		case B_OK:
+-			device->status = B_USB_RAW_STATUS_SUCCESS;
+-			break;
++			return B_USB_RAW_STATUS_SUCCESS;
+ 		case B_TIMED_OUT:
+-			device->status = B_USB_RAW_STATUS_TIMEOUT;
+-			break;
++			return B_USB_RAW_STATUS_TIMEOUT;
+ 		case B_CANCELED:
+-			device->status = B_USB_RAW_STATUS_ABORTED;
+-			break;
++			return B_USB_RAW_STATUS_ABORTED;
+ 		case B_DEV_CRC_ERROR:
+-			device->status = B_USB_RAW_STATUS_CRC_ERROR;
+-			break;
++			return B_USB_RAW_STATUS_CRC_ERROR;
+ 		case B_DEV_STALLED:
+-			device->status = B_USB_RAW_STATUS_STALLED;
+-			break;
++			return B_USB_RAW_STATUS_STALLED;
+ 		default:
+-			device->status = B_USB_RAW_STATUS_FAILED;
+-			break;
++			return B_USB_RAW_STATUS_FAILED;
+ 	}
++}
++
+ 
++static void
++usb_raw_transfer_callback(void *cookie, status_t status, void *data,
++	size_t actualLength)
++{
++	raw_transfer *transfer = (raw_transfer *)cookie;
++	transfer->status = raw_status_for(status);
++	transfer->actual_length = actualLength;
++	release_sem(transfer->notify);
++}
++
++
++static void
++usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
++{
++	TRACE((DRIVER_NAME": callback()\n"));
++	raw_device *device = (raw_device *)cookie;
++	device->status = raw_status_for(status);
+ 	device->actual_length = actualLength;
+ 	release_sem(device->notify);
+ }
+@@ -856,39 +873,61 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				}
+ 			}
+ 
++			// Every transfer has its own state, and the device lock is only held
++			// while queueing. So several transfers of one device can be in
++			// flight, which a stream needs to not lose data in between.
++			raw_transfer transfer;
++			transfer.notify = create_sem(0, "usb_raw transfer notify");
++			if (transfer.notify < B_OK) {
++				command.transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++				command.transfer.length = 0;
++				break;
++			}
++
+ 			status_t status;
+ 			MutexLocker deviceLocker(device->lock);
+ 			if (op == B_USB_RAW_COMMAND_INTERRUPT_TRANSFER) {
+ 				status = gUSBModule->queue_interrupt(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+-					usb_raw_callback, device);
++					usb_raw_transfer_callback, &transfer);
+ 			} else if (op == B_USB_RAW_COMMAND_BULK_TRANSFER) {
+ 				status = gUSBModule->queue_bulk(endpointInfo->handle,
+ 					transferData, command.transfer.length,
+-					usb_raw_callback, device);
++					usb_raw_transfer_callback, &transfer);
+ 			} else {
+ 				status = gUSBModule->queue_isochronous(endpointInfo->handle,
+ 					command.isochronous.data, command.isochronous.length,
+ 					packetDescriptors, command.isochronous.packet_count, NULL,
+-					0, usb_raw_callback, device);
++					0, usb_raw_transfer_callback, &transfer);
+ 			}
++			deviceLocker.Unlock();
+ 
+ 			if (status < B_OK) {
++				delete_sem(transfer.notify);
+ 				command.transfer.status = B_USB_RAW_STATUS_FAILED;
+ 				command.transfer.length = 0;
+ 				status = B_OK;
+ 				break;
+ 			}
+ 
+-			status = acquire_sem_etc(device->notify, 1, B_KILL_CAN_INTERRUPT, 0);
++			status = acquire_sem_etc(transfer.notify, 1, B_KILL_CAN_INTERRUPT, 0);
+ 			if (status != B_OK) {
+-				gUSBModule->cancel_queued_transfers(endpointInfo->handle);
+-				acquire_sem(device->notify);
++				// Interrupted. A transfer that has finished meanwhile, for
++				// example because another thread cancelled all transfers of
++				// the endpoint, needs no cancel of its own. Cancelling is
++				// done by one thread at a time.
++				if (acquire_sem_etc(transfer.notify, 1, B_RELATIVE_TIMEOUT, 0)
++						!= B_OK) {
++					MutexLocker cancelLocker(device->lock);
++					gUSBModule->cancel_queued_transfers(endpointInfo->handle);
++					cancelLocker.Unlock();
++					acquire_sem(transfer.notify);
++				}
+ 			}
++			delete_sem(transfer.notify);
+ 
+-			command.transfer.status = device->status;
+-			command.transfer.length = device->actual_length;
+-			deviceLocker.Unlock();
++			command.transfer.status = transfer.status;
++			command.transfer.length = transfer.actual_length;
+ 
+ 			if (command.transfer.status == B_OK)
+ 				status = B_OK;
+-- 
+2.54.1
+

@@ -1,0 +1,116 @@
+From b02830edc2cc7f7787e0beff7679e867048047b9 Mon Sep 17 00:00:00 2001
+From: Dru Satori <dru@druware.com>
+Date: Mon, 16 Nov 2026 17:42:17 -0500
+Subject: [PATCH 18/34] Network: update the wireless menu in place
+
+InterfaceView::_Update() runs on every pulse and matches menu items
+against the scan list with wireless_network::operator==, which also
+compares the signal strength. Every change in signal therefore removes
+the item and adds a new one, so the menu flickers, items move while
+the user is choosing, and the menu is rebuilt even while it is open.
+Removed items were also leaked, and the removal loop skipped the item
+that followed a removed one.
+
+Match items by BSSID and refresh the label and signal of a found item
+in place (new WirelessNetworkMenuItem::SetNetwork()). Leave the menu
+alone while it is open. Delete removed items and do not skip the next
+one.
+
+Assisted-by: Claude Opus 5.5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Dru Satori <dru@druware.com>
+(cherry picked from commit 87bd605eaccd64563f3d09bf6e13faa3c1dd17c9)
+---
+ .../networkstatus/WirelessNetworkMenuItem.cpp     | 12 ++++++++++--
+ src/apps/networkstatus/WirelessNetworkMenuItem.h  |  1 +
+ src/preferences/network/InterfaceView.cpp         | 15 +++++++++++----
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+index 940711db66..c0c49e5ea9 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+@@ -21,9 +21,17 @@
+ WirelessNetworkMenuItem::WirelessNetworkMenuItem(wireless_network network,
+ 	BMessage* message)
+ 	:
+-	BMenuItem(network.name, message),
+-	fNetwork(network)
++	BMenuItem(network.name, message)
+ {
++	SetNetwork(network);
++}
++
++
++void
++WirelessNetworkMenuItem::SetNetwork(const wireless_network& network)
++{
++	fNetwork = network;
++
+ 	// Append authentication mode to label
+ 	BString label = B_TRANSLATE("%name% (%authenticationMode%)");
+ 	label.Replace("%name%", network.name, 1);
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.h b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+index f0d0b719bf..07373e6327 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.h
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+@@ -18,6 +18,7 @@ public:
+ 	virtual						~WirelessNetworkMenuItem();
+ 
+ 			wireless_network	Network() const { return fNetwork; }
++			void				SetNetwork(const wireless_network& network);
+ 
+ 			BString 			AuthenticationName(int32 mode);
+ 
+diff --git a/src/preferences/network/InterfaceView.cpp b/src/preferences/network/InterfaceView.cpp
+index 5267f6d146..09b99134d3 100644
+--- a/src/preferences/network/InterfaceView.cpp
++++ b/src/preferences/network/InterfaceView.cpp
+@@ -239,7 +239,9 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 	else if (!fNetworkMenuField->IsHidden(fNetworkMenuField) && !isWireless)
+ 		fNetworkMenuField->Hide();
+ 
+-	if (isWireless && updateWirelessNetworks) {
++	// Don't touch the network menu while it is open (it has a window then)
++	if (isWireless && updateWirelessNetworks
++		&& fNetworkMenuField->Menu()->Window() == NULL) {
+ 		// Rebuild network menu
+ 		BMenu* menu = fNetworkMenuField->Menu();
+ 		int32 count = menu->CountItems();
+@@ -303,7 +305,9 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 
+ 			bool networkFound = false;
+ 			for (uint32 i = 0; i < networksCount; i++) {
+-				if (networkItem->Network() == networks[i]) {
++				// Not operator==, which also compares the ever-changing
++				// signal strength.
++				if (networkItem->Network().address == networks[i].address) {
+ 					networkFound = true;
+ 					break;
+ 				}
+@@ -311,7 +315,9 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 
+ 			if (!networkFound) {
+ 				menu->RemoveItem(networkItem);
++				delete networkItem;
+ 				count--;
++				index--;
+ 			}
+ 		}
+ 
+@@ -327,9 +333,10 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 				if (networkItem == NULL)
+ 					break;
+ 
+-				if (networkItem->Network() == network) {
+-					// found it
++				if (networkItem->Network().address == network.address) {
++					// found it, refresh signal/label in place
+ 					networkFound = true;
++					networkItem->SetNetwork(network);
+ 					if (associated.find(network.address) != associated.end())
+ 						networkItem->SetMarked(true);
+ 					break;
+-- 
+2.54.1
+

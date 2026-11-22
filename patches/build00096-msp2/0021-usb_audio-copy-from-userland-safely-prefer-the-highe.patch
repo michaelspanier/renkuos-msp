@@ -1,0 +1,552 @@
+From da1bab531971aa0caed5e965826a82c384757484 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 10:32:43 +0000
+Subject: [PATCH 21/34] usb_audio: copy from userland safely, prefer the
+ highest rate, keep gains
+
+msp: from HaikiDevKI's patch 1-usb_audio.patch, not in any PR.
+---
+ .../audio/usb/AudioControlInterface.cpp       | 126 +++++++++++++++++-
+ .../drivers/audio/usb/AudioControlInterface.h |  25 +++-
+ .../audio/usb/AudioStreamingInterface.cpp     |  12 ++
+ .../audio/usb/AudioStreamingInterface.h       |   3 +
+ .../kernel/drivers/audio/usb/Device.cpp       |   2 +-
+ .../kernel/drivers/audio/usb/Stream.cpp       | 103 +++++++++++---
+ src/add-ons/kernel/drivers/audio/usb/Stream.h |  10 +-
+ 7 files changed, 247 insertions(+), 34 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.cpp b/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.cpp
+index 28e3a9e405..74ee245f4f 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "AudioControlInterface.h"
+ 
++#include <string.h>
++
+ #include <usb/USB_audio.h>
+ 
+ #include "Device.h"
+@@ -1002,13 +1004,16 @@ AudioControlInterface::AudioControlInterface(Device* device)
+ 	fControlsBitmap(0),
+ 	fLastClockId(0),
+ 	fLastClockRate(0),
+-	fDevice(device)
++	fDevice(device),
++	fSavedMixLock(B_SPINLOCK_INITIALIZER),
++	fSavedMixCount(0)
+ {
+ }
+ 
+ 
+ AudioControlInterface::~AudioControlInterface()
+ {
++
+ 	for (AudioControlsIterator I = fAudioControls.Begin();
+ 			I != fAudioControls.End(); I++)
+ 		delete I->Value();
+@@ -1596,13 +1601,17 @@ AudioControlInterface::InitHardwareGains()
+ 			}
+ 		}
+ 	}
++
++	// The defaults above only exist to wake devices that power up silent.
++	// Whatever the media node chose since overrides them.
++	_RestoreMixValues();
+ }
+ 
+ 
+ uint32
+ AudioControlInterface::GetChannelsDescription(
+ 	Vector<multi_channel_info>& Channels, multi_description* Description,
+-	Vector<_AudioControl*>& Terminals, bool isForInput)
++	Vector<_AudioControl*>& Terminals, bool isForInput, uint32 streamChannels)
+ {
+ 	uint32 addedChannels = 0;
+ 
+@@ -1614,8 +1623,23 @@ AudioControlInterface::GetChannelsDescription(
+ 			continue;
+ 		}
+ 
++		// The buffers carry as many channels as the stream format says
++		// (see _GetBuffers), so describe that many. The Logitech C920 has a
++		// microphone terminal with bNrChannels 1 but bmChannelConfig left and
++		// right, and streams two channels: going by the terminal, the media
++		// node took only the left one.
++		uint32 channelCount = cluster->ChannelsCount();
++		if (streamChannels != 0 && streamChannels != channelCount) {
++			TRACE(ERR, "Terminal #%d declares %u channels, its stream carries "
++				"%u; describing %u.\n", Terminals[i]->ID(),
++				(unsigned)channelCount, (unsigned)streamChannels,
++				(unsigned)streamChannels);
++			channelCount = streamChannels;
++		}
++
+ 		uint32 channels = GetTerminalChannels(Channels, cluster,
+-			isForInput ? B_MULTI_INPUT_CHANNEL : B_MULTI_OUTPUT_CHANNEL);
++			isForInput ? B_MULTI_INPUT_CHANNEL : B_MULTI_OUTPUT_CHANNEL, 0,
++			channelCount);
+ 
+ 		if (isForInput)
+ 			Description->input_channel_count += channels;
+@@ -1631,9 +1655,13 @@ AudioControlInterface::GetChannelsDescription(
+ 
+ uint32
+ AudioControlInterface::GetTerminalChannels(Vector<multi_channel_info>& Channels,
+-		AudioChannelCluster* cluster, channel_kind kind, uint32 connectors)
++		AudioChannelCluster* cluster, channel_kind kind, uint32 connectors,
++		uint32 channelCount)
+ {
+-	if (cluster->ChannelsCount() < 2) { // mono channel
++	if (channelCount == 0)
++		channelCount = cluster->ChannelsCount();
++
++	if (channelCount < 2) { // mono channel
+ 		multi_channel_info info;
+ 		info.channel_id	= Channels.Count();
+ 		info.kind		= kind;
+@@ -1645,7 +1673,6 @@ AudioControlInterface::GetTerminalChannels(Vector<multi_channel_info>& Channels,
+ 	}
+ 
+ 	uint32 startCount = Channels.Count();
+-	uint32 channelCount = cluster->ChannelsCount();
+ 
+ 	// Haiku multi-aduio designations have the same bits
+ 	// as USB Audio 2.0 cluster spatial locations :-)
+@@ -2515,6 +2542,19 @@ AudioControlInterface::ListMixControls(multi_mix_control_info* Info)
+ }
+ 
+ 
++/*!	Whether a failed control request means the device is going away. The
++	media node keeps polling its controls; between the physical unplug and
++	Device::Removed() its requests come back cancelled or with a transaction
++	error. That is expected, not a fault of the control.
++*/
++static bool
++device_is_leaving(status_t status)
++{
++	return status == B_CANCELED || status == B_DEV_CRC_ERROR
++		|| status == B_DEV_NOT_READY;
++}
++
++
+ status_t
+ AudioControlInterface::GetMix(multi_mix_value_info* Info)
+ {
+@@ -2569,6 +2609,13 @@ AudioControlInterface::GetMix(multi_mix_value_info* Info)
+ 			REQ_VALUE(Info->values[i].id), REQ_INDEX(Info->values[i].id),
+ 			length, &data, &actualLength);
+ 
++		if (device_is_leaving(status)) {
++			// The values left in Info would be stale; say so instead of
++			// returning B_OK with them.
++			TRACE(INF, "Device is leaving; mix values not read (%#08x).\n",
++				status);
++			return B_DEV_NOT_READY;
++		}
+ 		if (status != B_OK || actualLength != length) {
+ 			TRACE(ERR, "Request (%04x:%04x) failed:%#08x; received %d of %d\n",
+ 				REQ_VALUE(Info->values[i].id), REQ_INDEX(Info->values[i].id),
+@@ -2705,6 +2752,13 @@ AudioControlInterface::SetMix(multi_mix_value_info* Info)
+ 			REQ_VALUE(Info->values[i].id), REQ_INDEX(Info->values[i].id),
+ 			length, &data, &actualLength);
+ 
++		if (device_is_leaving(status)) {
++			// Not remembered either: the replug must restore the value the
++			// device last accepted.
++			TRACE(INF, "Device is leaving; mix values not set (%#08x).\n",
++				status);
++			return B_DEV_NOT_READY;
++		}
+ 		if (status != B_OK || actualLength != length) {
+ 			TRACE(ERR, "Request (%04x:%04x) failed:%#08x; send %d of %d\n",
+ 				REQ_VALUE(Info->values[i].id), REQ_INDEX(Info->values[i].id),
+@@ -2713,8 +2767,68 @@ AudioControlInterface::SetMix(multi_mix_value_info* Info)
+ 		}
+ 
+ 		TRACE(MIX, "Value set OK\n");
++		_SaveMixValue(Info->values[i].id, data, length);
+ 	}
+ 
+ 	return B_OK;
+ }
+ 
++
++void
++AudioControlInterface::_SaveMixValue(int32 id, int16 data, uint16 length)
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fSavedMixLock);
++
++	int32 slot = 0;
++	while (slot < fSavedMixCount && fSavedMix[slot].id != id)
++		slot++;
++	bool full = slot >= kMaxSavedMixValues;
++	if (!full) {
++		fSavedMix[slot].id = id;
++		fSavedMix[slot].data = data;
++		fSavedMix[slot].length = length;
++		if (slot == fSavedMixCount)
++			fSavedMixCount++;
++	}
++
++	release_spinlock(&fSavedMixLock);
++	restore_interrupts(state);
++
++	if (full) {
++		TRACE(ERR, "No room to remember control %#08x; a replug will reset "
++			"it.\n", id);
++	}
++}
++
++
++/*!	Writes the values the media node set back to the device. A replugged
++	device was power cycled, and InitHardwareGains() has just put every
++	feature unit to its default; without this the C920 microphone always
++	came back at its 14 dB minimum while the media node still showed the
++	user's gain.
++*/
++void
++AudioControlInterface::_RestoreMixValues()
++{
++	SavedMixValue values[kMaxSavedMixValues];
++	int32 count;
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fSavedMixLock);
++	count = fSavedMixCount;
++	memcpy(values, fSavedMix, count * sizeof(SavedMixValue));
++	release_spinlock(&fSavedMixLock);
++	restore_interrupts(state);
++
++	for (int32 i = 0; i < count; i++) {
++		int16 data = values[i].data;
++		size_t actualLength = 0;
++		status_t status = gUSBModule->send_request(fDevice->USBDevice(),
++			USB_REQTYPE_INTERFACE_OUT | USB_REQTYPE_CLASS, USB_AUDIO_SET_CUR,
++			REQ_VALUE(values[i].id), REQ_INDEX(values[i].id), values[i].length,
++			&data, &actualLength);
++		TRACE(INF, "Restore control %#08x to %d: %#x\n", values[i].id,
++			(int)data, (int)status);
++	}
++}
++
+diff --git a/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.h b/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.h
+index 85b76a7572..f43d0c4aa2 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.h
++++ b/src/add-ons/kernel/drivers/audio/usb/AudioControlInterface.h
+@@ -9,6 +9,7 @@
+ 
+ 
+ #include <USB3.h>
++#include <KernelExport.h>
+ #include <hmulti_audio.h>
+ #include <usb/USB_audio.h>
+ #include <util/VectorMap.h>
+@@ -328,7 +329,7 @@ public:
+ 								Vector<multi_channel_info>& Channels,
+ 								multi_description* Description,
+ 								Vector<_AudioControl*>& USBTerminals,
+-								bool isForInput);
++								bool isForInput, uint32 streamChannels = 0);
+ 			uint32			GetBusChannelsDescription(
+ 								Vector<multi_channel_info>& Channels,
+ 								multi_description* Description);
+@@ -344,7 +345,8 @@ protected:
+ 			uint32			GetTerminalChannels(
+ 								Vector<multi_channel_info>& Channels,
+ 								AudioChannelCluster* cluster,
+-								channel_kind kind, uint32 connectors = 0);
++								channel_kind kind, uint32 connectors = 0,
++								uint32 channelCount = 0);
+ 
+ 			void			_HarvestRecordFeatureUnits(_AudioControl* rootControl,
+ 								AudioControlsMap& Map);
+@@ -398,6 +400,25 @@ protected:
+ 			AudioControlsMap	fOutputTerminals;
+ 			// map to store output terminal and lookup them by control ID
+ 			AudioControlsMap	fInputTerminals;
++
++			// Values the media node set through SetMix(), replayed by
++			// InitHardwareGains() so a replug or reopen keeps the user's gain
++			// instead of the power-up default. Fixed size: SetMix() must not
++			// allocate, and a device has only a handful of controls.
++			struct SavedMixValue {
++				int32		id;
++				int16		data;
++				uint16		length;
++			};
++	static	const int32		kMaxSavedMixValues = 32;
++
++			void			_SaveMixValue(int32 id, int16 data,
++								uint16 length);
++			void			_RestoreMixValues();
++
++			spinlock		fSavedMixLock;
++			SavedMixValue	fSavedMix[kMaxSavedMixValues];
++			int32			fSavedMixCount;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.cpp b/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.cpp
+index d6f7c17450..b9d78b9f63 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.cpp
+@@ -602,6 +602,18 @@ AudioStreamingInterface::ChannelCluster()
+ }
+ 
+ 
++uint8
++AudioStreamingInterface::ChannelCount()
++{
++	if (fActiveAlternate >= (size_t)fAlternates.Count())
++		return 0;
++	_ASFormatDescriptor* format = fAlternates[fActiveAlternate]->Format();
++	if (format == NULL || format->fFormatType != USB_AUDIO_FORMAT_TYPE_I)
++		return 0;
++	return static_cast<TypeIFormatDescriptor*>(format)->fNumChannels;
++}
++
++
+ void
+ AudioStreamingInterface::GetFormatsAndRates(multi_description* Description)
+ {
+diff --git a/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.h b/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.h
+index 1401fded26..af098394ca 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.h
++++ b/src/add-ons/kernel/drivers/audio/usb/AudioStreamingInterface.h
+@@ -151,6 +151,9 @@ public:
+ 			bool				IsInput() { return fIsInput; }
+ 
+ 			AudioChannelCluster* ChannelCluster();
++			// Channels per frame in the active alternate's format, 0 if
++			// unknown. This is what the stream actually carries.
++			uint8				ChannelCount();
+ 
+ 			void				GetFormatsAndRates(
+ 									multi_description* Description);
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index d5ad17ef47..4c315748d9 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -993,7 +993,7 @@ Device::_MultiGetDescription(multi_description* multiDescription)
+ 		USBTerminal.PushBack(fAudioControl.Find(fStreams[i]->TerminalLink()));
+ 
+ 		fAudioControl.GetChannelsDescription(Channels, &Description, USBTerminal,
+-			fStreams[i]->IsInput());
++			fStreams[i]->IsInput(), fStreams[i]->ChannelCount());
+ 		fStreams[i]->GetFormatsAndRates(&Description);
+ 	}
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 8089324c03..c3cf56e4b4 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -121,11 +121,34 @@ Stream::~Stream()
+ }
+ 
+ 
++/*!	Highest sampling rate an alternate advertises, ignoring rates above the
++	max_rate setting. For a continuous range the list holds its bounds, so the
++	upper bound counts. Returns 0 if no rate is known yet (UAC2 reads its rates
++	from the clock source later).
++*/
++static uint32
++highest_rate(TypeIFormatDescriptor* format)
++{
++	uint32 highest = 0;
++	for (int32 i = 0; i < format->fSampleFrequencies.Count(); i++) {
++		uint32 rate = format->fSampleFrequencies[i];
++		if (gMaxRate != 0 && rate > gMaxRate)
++			continue;
++		if (rate > highest)
++			highest = rate;
++	}
++	return highest;
++}
++
++
+ status_t
+ Stream::_ChooseAlternate()
+ {
+-	// lookup alternate with maximal (ch * 100 + resolution)
++	// Look up the alternate with maximal (ch * 100 + resolution). On a tie take
++	// the one with the higher rate: the Logitech C920 offers 16, 24 and 32 kHz
++	// as three alternates of the same width, and the first one sounds dull.
+ 	uint16 maxChxRes = 0;
++	uint32 maxRate = 0;
+ 	for (int i = 0; i < fAlternates.Count(); i++) {
+ 		if (fAlternates[i]->Interface() == 0) {
+ 			TRACE(INF, "Ignore alternate %d - zero interface description.\n", i);
+@@ -209,8 +232,10 @@ Stream::_ChooseAlternate()
+ 		}
+ 
+ 		uint16 chxRes = format->fNumChannels * 100 + format->fBitResolution;
+-		if (chxRes > maxChxRes) {
++		uint32 rate = highest_rate(format);
++		if (chxRes > maxChxRes || (chxRes == maxChxRes && rate > maxRate)) {
+ 			maxChxRes = chxRes;
++			maxRate = rate;
+ 			fActiveAlternate = i;
+ 		}
+ 	}
+@@ -390,6 +415,37 @@ Stream::_ReportRunHealth()
+ }
+ 
+ 
++// The kernel clone must map the very pages the client sees, or audio written
++// by one side is invisible to the other (the hrev59811 silence). B_FULL_LOCK
++// guarantees it; this proves it once per buffer setup, page by page, without
++// touching the contents.
++status_t
++Stream::_CheckKernelMapping() const
++{
++	for (size_t offset = 0; offset < fAreaSize; offset += B_PAGE_SIZE) {
++		physical_entry client;
++		physical_entry kernel;
++		status_t status = get_memory_map(fBuffers + offset, B_PAGE_SIZE,
++			&client, 1);
++		if (status == B_OK) {
++			status = get_memory_map(fKernelBuffers + offset, B_PAGE_SIZE,
++				&kernel, 1);
++		}
++		if (status != B_OK) {
++			TRACE(ERR, "No physical page for buffer offset %#lx: %s\n",
++				(unsigned long)offset, strerror(status));
++			return status;
++		}
++		if (client.address != kernel.address) {
++			TRACE(ERR, "Kernel clone maps another page at offset %#lx\n",
++				(unsigned long)offset);
++			return B_ERROR;
++		}
++	}
++	return B_OK;
++}
++
++
+ status_t
+ Stream::_SetupBuffers()
+ {
+@@ -656,7 +712,10 @@ Stream::_SetupBuffers()
+ 	}
+ 
+ 	// The kernel is not allowed to touch userspace areas, so we clone our
+-	// area into kernel space.
++	// area into kernel space. fArea carries user protection, so on a CPU with
++	// SMAP every kernel access through fBuffers is a fatal fault (seen as a
++	// panic in _RepackCapture on a Kaby Lake T470s over xHCI). All kernel
++	// reads and writes of the media buffers go through fKernelBuffers.
+ 	fKernelArea = clone_area("usb_audio cloned area", (void**)&fKernelBuffers,
+ 		B_ANY_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, fArea);
+ 	if (fKernelArea < 0) {
+@@ -664,6 +723,10 @@ Stream::_SetupBuffers()
+ 		return fStatus;
+ 	}
+ 
++	fStatus = _CheckKernelMapping();
++	if (fStatus != B_OK)
++		return fStatus;
++
+ 	TRACE(INF, "Created area id:%d at addr:%#010x size:%#010lx\n",
+ 		fArea, fDescriptors, fAreaSize);
+ 
+@@ -683,12 +746,12 @@ Stream::_SetupBuffers()
+ 	// The wire buffer - what queue_isochronous hands to the host controller -
+ 	// is a separate B_CONTIGUOUS kernel area (the same allocation policy hda
+ 	// uses for its DMA buffers). The USB finisher thread fills it at queue
+-	// time from the ORIGINAL mixer area VA (fBuffers) - packing to 3-byte
+-	// samples, or memcpy for native formats. It must not
+-	// alias the mixer area, and no other context may be responsible for
+-	// filling it: cross-context writes through clones of these areas are not
+-	// reliably visible to the finisher on x86_64 hrev59811 (a wire capture
+-	// showed 68% zeros while the writing context saw all buffers filled).
++	// time from the mixer area through fKernelBuffers - packing to 3-byte
++	// samples, or memcpy for native formats. It must not alias the mixer
++	// area, and no other context may be responsible for filling it. (On
++	// x86_64 hrev59811, before B_FULL_LOCK, a wire capture showed 68% zeros
++	// while the writing context saw all buffers filled: the lazily-committed
++	// mappings had diverged. _CheckKernelMapping now proves they share pages.)
+ 	{
+ 		size_t wireAreaSize = fSamplesCount * fWireSampleSize;
+ 		wireAreaSize = (wireAreaSize + (B_PAGE_SIZE - 1)) &~ (B_PAGE_SIZE - 1);
+@@ -1348,21 +1411,18 @@ Stream::Stop()
+ 
+ 
+ // Build the wire chunk for an outgoing buffer at queue time, in the USB
+-// finisher thread, reading the ORIGINAL buffer area VA (fBuffers). Rationale
+-// (x86_64 hrev59811, proven by a wire capture): the controller's TD data is
+-// snapshotted at submit; and kernel-CLONE writes made in the ioctl context
+-// are NOT reliably visible to this thread - the captured wire stream was 68%
+-// zeros while the ioctl context saw every buffer tone-filled. The original
+-// area VA is the one view this thread provably reads correctly (B_FULL_LOCK
+-// makes client writes visible there), so it is the single source of truth
+-// for the wire.
++// finisher thread, reading the mixer area through fKernelBuffers. The
++// controller's TD data is snapshotted at submit, so the wire chunk is built
++// here and nowhere else. fBuffers must not be read here: it is user-mapped,
++// and SMAP turns the access into a panic. fKernelBuffers maps the same pages
++// (checked by _CheckKernelMapping).
+ void
+ Stream::_StageWireChunk(size_t queuedBuffer, bool staleSlot)
+ {
+ 	size_t framesPerBuffer = fSamplesCount / fBufferCount;
+ 	size_t mediaChunkSize = fMediaSampleSize * framesPerBuffer;
+ 	size_t wireChunkSize = fWireSampleSize * framesPerBuffer;
+-	uint8* mediaChunk = fBuffers + mediaChunkSize * queuedBuffer;
++	uint8* mediaChunk = fKernelBuffers + mediaChunkSize * queuedBuffer;
+ 	uint8* wireChunk = fWireBuffers + wireChunkSize * queuedBuffer;
+ 
+ 	// DIAG (test_tone setting): put a generated 440Hz square wave on the wire
+@@ -2142,10 +2202,9 @@ Stream::_RepackCapture(void* scratch, size_t& completed)
+ 				continue;
+ 
+ 			// Complete: convert into the media record buffer through the
+-			// ORIGINAL area VA (fBuffers), in this (completion) thread -- the
+-			// one view proven coherent with the client's mapping (see
+-			// _StageWireChunk).
+-			uint8* mediaChunk = fBuffers
++			// kernel clone (fKernelBuffers), in this (completion) thread. Not
++			// through fBuffers: it is user-mapped (see _StageWireChunk).
++			uint8* mediaChunk = fKernelBuffers
+ 				+ fCaptureSlot * framesPerBuffer * fMediaSampleSize;
+ 			if (fNeedsPacking) {
+ 				_Unpack24(slot, mediaChunk,
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.h b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+index 8c7cbf68af..e790cd6767 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+@@ -189,6 +189,10 @@ protected:
+ 			size_t			fPlaybackCarryLength;
+ 			usb_iso_packet_descriptor* fDescriptors;
+ 			size_t			fDescriptorsCount;
++			// fBuffers: the address handed to the client (fArea carries user
++			// protection). fKernelBuffers: kernel-only clone of the same pages,
++			// the only view kernel code may touch -- with SMAP, a kernel access
++			// through fBuffers is a fatal fault.
+ 			uint8*			fBuffers;
+ 			uint8*			fKernelBuffers;
+ 			size_t			fCurrentBuffer;
+@@ -206,9 +210,8 @@ protected:
+ 			uint16			fStreamChannels;
+ 			// Separate B_CONTIGUOUS kernel-only buffer holding the wire-format
+ 			// data handed to queue_isochronous. The wire chunk is (re)built at
+-			// queue time in the completion thread from the ORIGINAL mixer area
+-			// VA (fBuffers): cross-team clone writes are not reliably visible
+-			// across contexts on x86_64 hrev59811 (see _SetupBuffers).
++			// queue time in the completion thread from the mixer area, through
++			// fKernelBuffers (see _SetupBuffers and _CheckKernelMapping).
+ 			area_id			fWireArea;
+ 			uint8*			fWireBuffers;
+ 			// client-team address of its clone of fArea (informational; the
+@@ -389,6 +392,7 @@ private:
+ 			status_t		_ResolveEndpoints(usb_interface_info* interface);
+ 			status_t		_ArmClockAndActivate();
+ 			status_t		_SetupBuffers();
++			status_t		_CheckKernelMapping() const;
+ 			// staleSlot: the media server has not refilled this buffer, so
+ 			// its contents are the previous rotation's audio. Silence goes on
+ 			// the wire instead of replaying it -- see _StageWireChunk.
+-- 
+2.54.1
+

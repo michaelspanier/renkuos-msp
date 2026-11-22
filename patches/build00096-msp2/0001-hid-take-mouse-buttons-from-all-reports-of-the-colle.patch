@@ -1,0 +1,1191 @@
+From 2530ce628a840a8678ff9ffa5d2f5229e91d640a Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Thu, 19 Nov 2026 12:34:25 +0000
+Subject: [PATCH 01/34] hid: take mouse buttons from all reports of the
+ collection
+
+Some mice send buttons and wheel in one HID report and the X/Y axes in
+another. The CHERRY DW 9100 Slim (USB 046a:c114) uses report ID 1 for
+buttons, wheel and pan, and report ID 2 for 12 bit X and Y. The mouse
+protocol handler only looked for buttons in the report that holds X
+and Y, so the pointer moved but clicks and the wheel were never seen.
+
+Add MouseReportDecoder. It finds buttons, wheel and pan in all input
+reports of the mouse collection and keeps the button state and the
+click count across reports. HIDParser::SetReport now hands the data to
+the report that arrived first and only then notifies the others.
+The new source is added to the Jamfiles of usb_hid, i2c_hid,
+bluetooth_hid and hyperv_hid, which all build the mouse handler.
+
+Mice that send everything in one report behave as before.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-sonnet-5-5
+(cherry picked from commit 59f97cd02e65cc3553065eb5a3e1a903d33a6557)
+---
+ .../drivers/input/bluetooth_hid/Jamfile       |   1 +
+ .../drivers/input/hid_shared/HIDParser.cpp    |  26 +-
+ .../drivers/input/hid_shared/HIDReport.h      |   1 +
+ .../input/hid_shared/MouseProtocolHandler.cpp | 115 +---
+ .../input/hid_shared/MouseProtocolHandler.h   |  23 +-
+ .../input/hid_shared/MouseReportDecoder.cpp   | 225 ++++++++
+ .../input/hid_shared/MouseReportDecoder.h     |  85 +++
+ .../kernel/drivers/input/hyperv_hid/Jamfile   |   1 +
+ .../kernel/drivers/input/i2c_hid/Jamfile      |   1 +
+ .../kernel/drivers/input/usb_hid/Jamfile      |   1 +
+ .../hid_shared/MouseReportDecoderTest.cpp     | 494 ++++++++++++++++++
+ 11 files changed, 853 insertions(+), 120 deletions(-)
+ create mode 100644 src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.cpp
+ create mode 100644 src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.h
+ create mode 100644 src/tests/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoderTest.cpp
+
+diff --git a/src/add-ons/kernel/drivers/input/bluetooth_hid/Jamfile b/src/add-ons/kernel/drivers/input/bluetooth_hid/Jamfile
+index c5d7b4aa5c..0afb976641 100644
+--- a/src/add-ons/kernel/drivers/input/bluetooth_hid/Jamfile
++++ b/src/add-ons/kernel/drivers/input/bluetooth_hid/Jamfile
+@@ -25,5 +25,6 @@ KernelAddon bluetooth_hid :
+ 	JoystickProtocolHandler.cpp
+ 	KeyboardProtocolHandler.cpp
+ 	MouseProtocolHandler.cpp
++	MouseReportDecoder.cpp
+ 	TabletProtocolHandler.cpp
+ ;
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/HIDParser.cpp b/src/add-ons/kernel/drivers/input/hid_shared/HIDParser.cpp
+index ddeee2a332..a947e78473 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/HIDParser.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/HIDParser.cpp
+@@ -458,6 +458,15 @@ HIDParser::MaxReportSize(uint8 type)
+ }
+ 
+ 
++static bool
++is_notified_report(HIDReport *report)
++{
++	return report != NULL
++		&& (report->Type() == HID_REPORT_TYPE_INPUT
++			|| report->Type() == HID_REPORT_TYPE_FEATURE);
++}
++
++
+ void
+ HIDParser::SetReport(status_t status, uint8 *report, size_t length)
+ {
+@@ -479,16 +488,17 @@ HIDParser::SetReport(status_t status, uint8 *report, size_t length)
+ 	// We need to notify all input reports, as we don't know who has waiting
+ 	// listeners. Anyone other than the target report also waiting for a
+ 	// transfer to happen needs to reschedule one now.
++	// The target report gets its data first. A listener that wakes up because
++	// another report came in may want to read the target report next to its
++	// own (a mouse with its buttons in a separate report does that), so the
++	// data must be there by then.
+ 	for (int32 i = 0; i < fReports.Count(); i++) {
+-		if (fReports[i] == NULL
+-			|| (fReports[i]->Type() != HID_REPORT_TYPE_INPUT
+-				&& fReports[i]->Type() != HID_REPORT_TYPE_FEATURE)) {
+-			continue;
+-		}
+-
+-		if (fReports[i]->ID() == targetID)
++		if (is_notified_report(fReports[i]) && fReports[i]->ID() == targetID)
+ 			fReports[i]->SetReport(status, report, length);
+-		else
++	}
++
++	for (int32 i = 0; i < fReports.Count(); i++) {
++		if (is_notified_report(fReports[i]) && fReports[i]->ID() != targetID)
+ 			fReports[i]->SetReport(B_BUSY, NULL, 0);
+ 	}
+ }
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/HIDReport.h b/src/add-ons/kernel/drivers/input/hid_shared/HIDReport.h
+index b3ec3e4ac3..79f909f7a0 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/HIDReport.h
++++ b/src/add-ons/kernel/drivers/input/hid_shared/HIDReport.h
+@@ -42,6 +42,7 @@ public:
+ 		void					SetReport(status_t status, uint8 *report,
+ 									size_t length);
+ 		uint8 *					CurrentReport() { return fCurrentReport; };
++		status_t				ReportStatus() { return fReportStatus; };
+ 
+ #ifndef USERLAND_HID
+ 		status_t				SendReport();
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
+index ee9b471f26..0ae1c6679f 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
+@@ -23,45 +23,14 @@
+ #include <keyboard_mouse_driver.h>
+ 
+ 
+-MouseProtocolHandler::MouseProtocolHandler(HIDReport &report,
+-	HIDReportItem &xAxis, HIDReportItem &yAxis)
++MouseProtocolHandler::MouseProtocolHandler(HIDCollection &collection,
++	HIDReport &report)
+ 	:
+ 	ProtocolHandler(report.Device(), "input/mouse/" DEVICE_PATH_SUFFIX "/", 0),
+ 	fReport(report),
+-
+-	fXAxis(xAxis),
+-	fYAxis(yAxis),
+-	fWheel(NULL),
+-	fHorizontalPan(NULL),
+-
+-	fLastButtons(0),
+-	fClickCount(0),
+-	fLastClickTime(0),
+-	fClickSpeed(250000)
++	fDecoder(collection, report)
+ {
+-	uint32 buttonCount = 0;
+-	for (uint32 i = 0; i < report.CountItems(); i++) {
+-		HIDReportItem *item = report.ItemAt(i);
+-		if (!item->HasData())
+-			continue;
+-
+-		if (item->UsagePage() == B_HID_USAGE_PAGE_BUTTON
+-			&& item->UsageID() - 1 < B_MAX_MOUSE_BUTTONS) {
+-			fButtons[buttonCount++] = item;
+-		}
+-	}
+-
+-	fButtons[buttonCount] = NULL;
+-
+-	fWheel = report.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP,
+-		B_HID_UID_GD_WHEEL);
+-	fHorizontalPan = report.FindItem(B_HID_USAGE_PAGE_CONSUMER,
+-		B_HID_UID_CON_AC_PAN);
+-
+-	TRACE("mouse device with %" B_PRIu32 " buttons %sand %swheel\n",
+-		buttonCount, fHorizontalPan == NULL ? "" : ", horizontal pan ",
+-		fWheel == NULL ? "no " : "");
+-	TRACE("report id: %u\n", report.ID());
++	TRACE("mouse device, report id: %u\n", report.ID());
+ }
+ 
+ 
+@@ -114,7 +83,7 @@ MouseProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
+ 			continue;
+ 
+ 		ProtocolHandler *newHandler = new(std::nothrow) MouseProtocolHandler(
+-			*inputReport, *xAxis, *yAxis);
++			collection, *inputReport);
+ 		if (newHandler == NULL) {
+ 			TRACE("failed to allocated mouse protocol handler\n");
+ 			continue;
+@@ -171,13 +140,17 @@ MouseProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
+ 		}
+ 
+ 		case MS_SET_CLICKSPEED:
++		{
++			bigtime_t clickSpeed;
+ 			if (!IS_USER_ADDRESS(buffer)
+-				|| user_memcpy(&fClickSpeed, buffer, sizeof(bigtime_t))
++				|| user_memcpy(&clickSpeed, buffer, sizeof(bigtime_t))
+ 					!= B_OK) {
+ 				return B_BAD_ADDRESS;
+ 			}
+ 
++			fDecoder.SetClickSpeed(clickSpeed);
+ 			return B_OK;
++		}
+ 	}
+ 
+ 	return B_ERROR;
+@@ -188,7 +161,13 @@ status_t
+ MouseProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
+ {
+ 	status_t result = fReport.WaitForReport(B_INFINITE_TIMEOUT);
+-	if (result != B_OK) {
++
++	// "busy" means that another report came in on the same input. For a mouse
++	// whose buttons are in a report of their own, that is the report to read.
++	bool ownReportArrived = result == B_OK;
++	bool otherReportArrived = result == B_BUSY && fDecoder.HasNewData();
++
++	if (!ownReportArrived && !otherReportArrived) {
+ 		if (fReport.Device()->IsRemoved()) {
+ 			TRACE("device has been removed\n");
+ 			return B_DEV_NOT_READY;
+@@ -200,7 +179,8 @@ MouseProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
+ 			return B_FILE_ERROR;
+ 
+ 		if (result != B_BUSY) {
+-			// "busy" happens when other reports come in on the same input as ours
++			// "busy" happens when other reports come in on the same input as
++			// ours
+ 			TRACE_ALWAYS("error waiting for report: %s\n", strerror(result));
+ 		}
+ 
+@@ -208,62 +188,11 @@ MouseProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
+ 		return B_BUSY;
+ 	}
+ 
+-	uint32 axisRelativeData[2];
+-	axisRelativeData[0] = 0;
+-	axisRelativeData[1] = 0;
+-
+-	if (fXAxis.Extract() == B_OK && fXAxis.Valid())
+-		axisRelativeData[0] = fXAxis.Data();
++	*(mouse_movement *)buffer = fDecoder.Decode(system_time());
+ 
+-	if (fYAxis.Extract() == B_OK && fYAxis.Valid())
+-		axisRelativeData[1] = fYAxis.Data();
++	if (ownReportArrived)
++		fReport.DoneProcessing();
+ 
+-	uint32 wheelData[2] = {0};
+-	if (fWheel != NULL && fWheel->Extract() == B_OK && fWheel->Valid())
+-		wheelData[0] = fWheel->Data();
+-	if (fHorizontalPan != NULL && fHorizontalPan->Extract() == B_OK
+-			&& fHorizontalPan->Valid())
+-		wheelData[1] = fHorizontalPan->Data();
+-
+-	uint32 buttons = 0;
+-	for (uint32 i = 0; i < B_MAX_MOUSE_BUTTONS; i++) {
+-		HIDReportItem *button = fButtons[i];
+-		if (button == NULL)
+-			break;
+-
+-		if (button->Extract() == B_OK && button->Valid())
+-			buttons |= (button->Data() & 1) << (button->UsageID() - 1);
+-	}
+-
+-	fReport.DoneProcessing();
+ 	TRACE("got mouse report\n");
+-
+-	int32 clicks = 0;
+-	bigtime_t timestamp = system_time();
+-	if (buttons != 0) {
+-		if (fLastButtons == 0) {
+-			if (fLastClickTime + fClickSpeed > timestamp)
+-				fClickCount++;
+-			else
+-				fClickCount = 1;
+-		}
+-
+-		fLastClickTime = timestamp;
+-		clicks = fClickCount;
+-	}
+-
+-	fLastButtons = buttons;
+-
+-	mouse_movement *info = (mouse_movement *)buffer;
+-	memset(info, 0, sizeof(mouse_movement));
+-
+-	info->buttons = buttons;
+-	info->xdelta = axisRelativeData[0];
+-	info->ydelta = -axisRelativeData[1];
+-	info->clicks = clicks;
+-	info->timestamp = timestamp;
+-	info->wheel_ydelta = -wheelData[0];
+-	info->wheel_xdelta = wheelData[1];
+-
+ 	return B_OK;
+ }
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.h b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.h
+index 301fe77480..86a5080aba 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.h
++++ b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.h
+@@ -8,6 +8,7 @@
+ 
+ #include <InterfaceDefs.h>
+ 
++#include "MouseReportDecoder.h"
+ #include "ProtocolHandler.h"
+ 
+ 
+@@ -15,16 +16,10 @@ class HIDCollection;
+ class HIDReportItem;
+ 
+ 
+-#ifndef B_MAX_MOUSE_BUTTONS
+-#	define B_MAX_MOUSE_BUTTONS		8
+-#endif
+-
+-
+ class MouseProtocolHandler : public ProtocolHandler {
+ public:
+-								MouseProtocolHandler(HIDReport &report,
+-									HIDReportItem &xAxis,
+-									HIDReportItem &yAxis);
++								MouseProtocolHandler(HIDCollection &collection,
++									HIDReport &report);
+ 
+ 	static	void				AddHandlers(HIDDevice &device,
+ 									HIDCollection &collection,
+@@ -37,17 +32,7 @@ private:
+ 			status_t			_ReadReport(void *buffer, uint32 *cookie);
+ 
+ 			HIDReport &			fReport;
+-
+-			HIDReportItem &		fXAxis;
+-			HIDReportItem &		fYAxis;
+-			HIDReportItem *		fWheel;
+-			HIDReportItem *		fHorizontalPan;
+-			HIDReportItem *		fButtons[B_MAX_MOUSE_BUTTONS];
+-
+-			uint32				fLastButtons;
+-			uint32				fClickCount;
+-			bigtime_t			fLastClickTime;
+-			bigtime_t			fClickSpeed;
++			MouseReportDecoder	fDecoder;
+ };
+ 
+ #endif // USB_MOUSE_PROTOCOL_HANDLER_H
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.cpp b/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.cpp
+new file mode 100644
+index 0000000000..ce2339e8ee
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.cpp
+@@ -0,0 +1,225 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "MouseReportDecoder.h"
++
++#include "HIDCollection.h"
++#include "HIDReport.h"
++#include "HIDReportItem.h"
++
++#include <string.h>
++#include <usb/USB_hid.h>
++
++
++static const bigtime_t kDefaultClickSpeed = 250000;
++
++
++static bool
++is_mouse_button(HIDReportItem &item)
++{
++	return item.UsagePage() == B_HID_USAGE_PAGE_BUTTON
++		&& item.UsageID() >= 1 && item.UsageID() <= B_MAX_MOUSE_BUTTONS;
++}
++
++
++MouseReportDecoder::MouseReportDecoder(HIDCollection &collection,
++	HIDReport &motionReport)
++	:
++	fMotionReport(motionReport),
++
++	fXAxis(motionReport.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP,
++		B_HID_UID_GD_X)),
++	fYAxis(motionReport.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP,
++		B_HID_UID_GD_Y)),
++	fWheel(NULL),
++	fHorizontalPan(NULL),
++
++	fReportCount(0),
++
++	fButtonState(0),
++	fClickCount(0),
++	fLastClickTime(0),
++	fClickSpeed(kDefaultClickSpeed)
++{
++	memset(fButtons, 0, sizeof(fButtons));
++
++	_RememberReport(motionReport);
++	_AddControlsOf(motionReport);
++	_AddControlsOfSiblingReports(collection);
++}
++
++
++bool
++MouseReportDecoder::HasNewData()
++{
++	for (uint32 i = 0; i < fReportCount; i++) {
++		if (fReports[i]->CurrentReport() != NULL
++				&& fReports[i]->ReportStatus() == B_OK) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++
++mouse_movement
++MouseReportDecoder::Decode(bigtime_t timestamp)
++{
++	uint32 previousButtons = fButtonState;
++	_UpdateButtonState();
++
++	mouse_movement movement;
++	memset(&movement, 0, sizeof(movement));
++	movement.timestamp = timestamp;
++	movement.buttons = fButtonState;
++	movement.clicks = _UpdateClickCount(previousButtons, timestamp);
++	movement.xdelta = _ValueOf(fXAxis);
++	movement.ydelta = -_ValueOf(fYAxis);
++	movement.wheel_ydelta = -_ValueOf(fWheel);
++	movement.wheel_xdelta = _ValueOf(fHorizontalPan);
++	return movement;
++}
++
++
++void
++MouseReportDecoder::SetClickSpeed(bigtime_t clickSpeed)
++{
++	fClickSpeed = clickSpeed;
++}
++
++
++/*!	Some mice report their buttons and the wheel in a report of their own,
++	next to the report with the axes. Controls that the motion report already
++	provides are not taken from these reports.
++*/
++void
++MouseReportDecoder::_AddControlsOfSiblingReports(HIDCollection &collection)
++{
++	uint32 maxReportCount
++		= fMotionReport.Parser()->CountReports(HID_REPORT_TYPE_INPUT);
++	HIDReport *reports[maxReportCount];
++	uint32 reportCount = 0;
++	collection.BuildReportList(HID_REPORT_TYPE_INPUT, reports, reportCount);
++
++	for (uint32 i = 0; i < reportCount; i++) {
++		if (reports[i] != &fMotionReport && !_IsMotionReport(*reports[i]))
++			_AddControlsOf(*reports[i]);
++	}
++}
++
++
++/*!	Takes the buttons, the wheel and the pan of \a report that are still
++	missing. The report is remembered if it provides at least one of them.
++*/
++void
++MouseReportDecoder::_AddControlsOf(HIDReport &report)
++{
++	bool providesControl = false;
++
++	for (uint32 i = 0; i < report.CountItems(); i++) {
++		HIDReportItem *item = report.ItemAt(i);
++		if (!item->HasData() || !is_mouse_button(*item))
++			continue;
++
++		HIDReportItem *&button = fButtons[item->UsageID() - 1];
++		if (button == NULL) {
++			button = item;
++			providesControl = true;
++		}
++	}
++
++	if (fWheel == NULL) {
++		fWheel = report.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP,
++			B_HID_UID_GD_WHEEL);
++		providesControl |= fWheel != NULL;
++	}
++
++	if (fHorizontalPan == NULL) {
++		fHorizontalPan = report.FindItem(B_HID_USAGE_PAGE_CONSUMER,
++			B_HID_UID_CON_AC_PAN);
++		providesControl |= fHorizontalPan != NULL;
++	}
++
++	if (providesControl)
++		_RememberReport(report);
++}
++
++
++void
++MouseReportDecoder::_RememberReport(HIDReport &report)
++{
++	for (uint32 i = 0; i < fReportCount; i++) {
++		if (fReports[i] == &report)
++			return;
++	}
++
++	if (fReportCount < kMaxReports)
++		fReports[fReportCount++] = &report;
++}
++
++
++/*!	Takes over the state of every button whose report has just arrived. Buttons
++	in reports that did not arrive keep their state.
++*/
++void
++MouseReportDecoder::_UpdateButtonState()
++{
++	for (uint32 i = 0; i < B_MAX_MOUSE_BUTTONS; i++) {
++		HIDReportItem *button = fButtons[i];
++		if (button == NULL || button->Extract() != B_OK)
++			continue;
++
++		// A value outside of the logical range counts as released.
++		uint32 mask = (uint32)1 << i;
++		if (button->Valid() && (button->Data() & 1) != 0)
++			fButtonState |= mask;
++		else
++			fButtonState &= ~mask;
++	}
++}
++
++
++/*!	Counts consecutive presses (double click and so on) and returns the click
++	count to report. While no button is pressed, the count to report is zero.
++*/
++uint32
++MouseReportDecoder::_UpdateClickCount(uint32 previousButtons,
++	bigtime_t timestamp)
++{
++	if (fButtonState == 0)
++		return 0;
++
++	if (previousButtons == 0) {
++		bool withinClickSpeed = fLastClickTime + fClickSpeed > timestamp;
++		fClickCount = withinClickSpeed ? fClickCount + 1 : 1;
++	}
++
++	fLastClickTime = timestamp;
++	return fClickCount;
++}
++
++
++bool
++MouseReportDecoder::_IsMotionReport(HIDReport &report)
++{
++	return report.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_X)
++			!= NULL
++		&& report.FindItem(B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_Y)
++			!= NULL;
++}
++
++
++int32
++MouseReportDecoder::_ValueOf(HIDReportItem *item)
++{
++	if (item == NULL || item->Extract() != B_OK || !item->Valid())
++		return 0;
++
++	return (int32)item->Data();
++}
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.h b/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.h
+new file mode 100644
+index 0000000000..b0c69f4d33
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoder.h
+@@ -0,0 +1,85 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef MOUSE_REPORT_DECODER_H
++#define MOUSE_REPORT_DECODER_H
++
++
++#include <SupportDefs.h>
++
++#include <keyboard_mouse_driver.h>
++
++
++class HIDCollection;
++class HIDReport;
++class HIDReportItem;
++
++
++#ifndef B_MAX_MOUSE_BUTTONS
++#	define B_MAX_MOUSE_BUTTONS		8
++#endif
++
++
++/*!	Turns the input reports of one HID mouse into mouse movements.
++
++	A mouse is described by a motion report, which holds the relative X and Y
++	axes. Buttons, wheel and horizontal pan are usually part of the same report,
++	but a device may place them in other input reports of the same collection.
++	The decoder keeps the state that spans reports (the pressed buttons and the
++	click count), so that it does not matter which report carried a change.
++
++	The decoder only reads what the HID parser has stored. It does not wait for
++	reports and does not touch the hardware, which keeps it testable outside of
++	the kernel.
++*/
++class MouseReportDecoder {
++public:
++								MouseReportDecoder(HIDCollection &collection,
++									HIDReport &motionReport);
++
++			//! Is there a report that has not been decoded yet?
++			bool				HasNewData();
++
++			mouse_movement		Decode(bigtime_t timestamp);
++
++			void				SetClickSpeed(bigtime_t clickSpeed);
++
++private:
++	static	const uint32		kMaxReports = 4;
++
++			void				_AddControlsOfSiblingReports(
++									HIDCollection &collection);
++			void				_AddControlsOf(HIDReport &report);
++			void				_RememberReport(HIDReport &report);
++			void				_UpdateButtonState();
++			uint32				_UpdateClickCount(uint32 previousButtons,
++									bigtime_t timestamp);
++
++	static	bool				_IsMotionReport(HIDReport &report);
++	static	int32				_ValueOf(HIDReportItem *item);
++
++			HIDReport &			fMotionReport;
++
++			HIDReportItem *		fXAxis;
++			HIDReportItem *		fYAxis;
++			HIDReportItem *		fWheel;
++			HIDReportItem *		fHorizontalPan;
++			HIDReportItem *		fButtons[B_MAX_MOUSE_BUTTONS];
++									// indexed by button usage id - 1
++
++			HIDReport *			fReports[kMaxReports];
++									// the motion report and every other report
++									// that holds one of the controls above
++			uint32				fReportCount;
++
++			uint32				fButtonState;
++			uint32				fClickCount;
++			bigtime_t			fLastClickTime;
++			bigtime_t			fClickSpeed;
++};
++
++
++#endif // MOUSE_REPORT_DECODER_H
+diff --git a/src/add-ons/kernel/drivers/input/hyperv_hid/Jamfile b/src/add-ons/kernel/drivers/input/hyperv_hid/Jamfile
+index 57f3f20994..5e3c7ad4f5 100644
+--- a/src/add-ons/kernel/drivers/input/hyperv_hid/Jamfile
++++ b/src/add-ons/kernel/drivers/input/hyperv_hid/Jamfile
+@@ -23,5 +23,6 @@ KernelAddon hyperv_hid :
+ 	JoystickProtocolHandler.cpp
+ 	KeyboardProtocolHandler.cpp
+ 	MouseProtocolHandler.cpp
++	MouseReportDecoder.cpp
+ 	TabletProtocolHandler.cpp
+ ;
+diff --git a/src/add-ons/kernel/drivers/input/i2c_hid/Jamfile b/src/add-ons/kernel/drivers/input/i2c_hid/Jamfile
+index a0450f0b27..cf7bdcf980 100644
+--- a/src/add-ons/kernel/drivers/input/i2c_hid/Jamfile
++++ b/src/add-ons/kernel/drivers/input/i2c_hid/Jamfile
+@@ -29,5 +29,6 @@ KernelAddon i2c_hid :
+ 	JoystickProtocolHandler.cpp
+ 	KeyboardProtocolHandler.cpp
+ 	MouseProtocolHandler.cpp
++	MouseReportDecoder.cpp
+ 	TabletProtocolHandler.cpp
+ ;
+diff --git a/src/add-ons/kernel/drivers/input/usb_hid/Jamfile b/src/add-ons/kernel/drivers/input/usb_hid/Jamfile
+index 1ae8817b5c..1997809962 100644
+--- a/src/add-ons/kernel/drivers/input/usb_hid/Jamfile
++++ b/src/add-ons/kernel/drivers/input/usb_hid/Jamfile
+@@ -27,5 +27,6 @@ KernelAddon usb_hid :
+ 	JoystickProtocolHandler.cpp
+ 	KeyboardProtocolHandler.cpp
+ 	MouseProtocolHandler.cpp
++	MouseReportDecoder.cpp
+ 	TabletProtocolHandler.cpp
+ ;
+diff --git a/src/tests/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoderTest.cpp b/src/tests/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoderTest.cpp
+new file mode 100644
+index 0000000000..89cac1b117
+--- /dev/null
++++ b/src/tests/add-ons/kernel/drivers/input/hid_shared/MouseReportDecoderTest.cpp
+@@ -0,0 +1,494 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Tests for MouseReportDecoder, run in userland on top of the real HID parser.
++
++	Build and run (on Haiku, from the top of the source tree):
++		S=src/add-ons/kernel/drivers/input/hid_shared
++		T=src/tests/add-ons/kernel/drivers/input/hid_shared
++		g++ -std=gnu++17 -DUSERLAND_HID -I $S \
++			-I src/add-ons/kernel/drivers/input/usb_hid \
++			-I src/bin/hid_decode -I headers/private/input \
++			-I headers/private/drivers -I headers/private/kernel \
++			-I headers/private $S/MouseReportDecoder.cpp \
++			$S/HIDCollection.cpp $S/HIDParser.cpp $S/HIDReport.cpp \
++			$S/HIDReportItem.cpp $S/HIDWriter.cpp \
++			$T/MouseReportDecoderTest.cpp \
++			-o MouseReportDecoderTest -lbe
++		./MouseReportDecoderTest
++*/
++
++
++#include "MouseReportDecoder.h"
++
++#include "HIDCollection.h"
++#include "HIDParser.h"
++#include "HIDReport.h"
++#include "HIDReportItem.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <usb/USB_hid.h>
++
++#include <memory>
++#include <vector>
++
++
++typedef std::vector<uint8> Packet;
++
++
++// --- Mouse descriptors ------------------------------------------------------
++
++// Boot protocol mouse from the HID specification (appendix B.2): three buttons,
++// X and Y, everything in a single report without report ID.
++static const uint8 kBootMouseDescriptor[] = {
++	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09,
++	0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01,
++	0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30,
++	0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
++	0xc0, 0xc0
++};
++
++// A mouse whose three buttons are two bits wide, with the logical range 0 to 1.
++// The values 2 and 3 are outside of that range. No report ID.
++static const uint8 kTwoBitButtonsDescriptor[] = {
++	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09,
++	0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x02, 0x95, 0x03,
++	0x81, 0x02, 0x75, 0x02, 0x95, 0x01, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30,
++	0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
++	0xc0, 0xc0
++};
++
++// Mouse interface of the CHERRY DW 9100 Slim (USB 046a:c114, interface 1),
++// read from the device. Buttons and wheel are in report 1, the 12 bit X and Y
++// axes are in report 2, report 9 is vendor specific.
++static const uint8 kCherryMouseDescriptor[] = {
++	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xa1, 0x00,
++	0x95, 0x05, 0x75, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00,
++	0x25, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03, 0x81, 0x01, 0x75, 0x08,
++	0x95, 0x01, 0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x81, 0x06,
++	0x05, 0x0c, 0x0a, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, 0xc0, 0x85, 0x02,
++	0x09, 0x01, 0xa1, 0x00, 0x75, 0x0c, 0x95, 0x02, 0x05, 0x01, 0x09, 0x30,
++	0x09, 0x31, 0x16, 0x01, 0xf8, 0x26, 0xff, 0x07, 0x81, 0x06, 0xc0, 0xc0,
++	0x06, 0xa0, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x09, 0x09, 0x01, 0x15,
++	0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x07, 0x91, 0x82, 0x09, 0x02,
++	0x75, 0x08, 0x95, 0x07, 0x81, 0x82, 0xc0
++};
++
++
++// --- Packets of the CHERRY mouse --------------------------------------------
++
++static const uint8 kCherryButtonsReportID = 1;
++static const uint8 kCherryMotionReportID = 2;
++static const uint8 kCherryVendorReportID = 9;
++
++static const uint8 kLeftButton = 0x01;
++static const uint8 kRightButton = 0x02;
++
++
++static Packet
++cherry_buttons_packet(uint8 buttons, int8 wheel = 0, int8 pan = 0)
++{
++	return Packet{kCherryButtonsReportID, buttons, (uint8)wheel, (uint8)pan};
++}
++
++
++static Packet
++cherry_motion_packet(int x, int y)
++{
++	// Two signed 12 bit values, X in the low and Y in the high half of 3 bytes.
++	uint32 packed = ((uint32)x & 0xfff) | (((uint32)y & 0xfff) << 12);
++	return Packet{kCherryMotionReportID, (uint8)(packed & 0xff),
++		(uint8)((packed >> 8) & 0xff), (uint8)((packed >> 16) & 0xff)};
++}
++
++
++static Packet
++cherry_vendor_packet()
++{
++	return Packet{kCherryVendorReportID, 0, 0, 0, 0, 0, 0, 0};
++}
++
++
++// --- Test fixture -----------------------------------------------------------
++
++// Far enough from zero that the first press does not count as a quick
++// second press.
++static const bigtime_t kFirstTimestamp = 10000000;
++
++
++struct Reception {
++	bool			producedMovement;
++	mouse_movement	movement;
++};
++
++
++/*!	Wires a parsed descriptor to a MouseReportDecoder the same way the driver
++	does and lets the test feed it packets as the hardware would.
++*/
++class MouseFixture {
++public:
++	MouseFixture(const uint8 *descriptor, size_t length)
++		:
++		fParser(NULL)
++	{
++		if (fParser.ParseReportDescriptor(descriptor, length) != B_OK) {
++			fprintf(stderr, "descriptor does not parse\n");
++			abort();
++		}
++
++		HIDCollection *collection = fParser.RootCollection()->ChildAtFlat(
++			COLLECTION_APPLICATION, 0);
++
++		std::vector<HIDReport *> reports(
++			fParser.CountReports(HID_REPORT_TYPE_INPUT));
++		uint32 reportCount = 0;
++		collection->BuildReportList(HID_REPORT_TYPE_INPUT, reports.data(),
++			reportCount);
++
++		for (uint32 i = 0; i < reportCount; i++) {
++			HIDReportItem *x = reports[i]->FindItem(
++				B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_X);
++			HIDReportItem *y = reports[i]->FindItem(
++				B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_Y);
++			if (x != NULL && y != NULL) {
++				fDecoder.reset(new MouseReportDecoder(*collection,
++					*reports[i]));
++				return;
++			}
++		}
++
++		fprintf(stderr, "descriptor has no mouse\n");
++		abort();
++	}
++
++	Reception Receive(const Packet &packet,
++		bigtime_t timestamp = kFirstTimestamp)
++	{
++		// The driver's transfer buffer is three bytes larger than the report,
++		// and HIDReportItem::Extract() always copies four bytes.
++		fLastPacket = packet;
++		fLastPacket.resize(packet.size() + 3, 0);
++		fParser.SetReport(B_OK, fLastPacket.data(), packet.size());
++
++		Reception reception;
++		reception.producedMovement = fDecoder->HasNewData();
++		memset(&reception.movement, 0, sizeof(reception.movement));
++		if (reception.producedMovement)
++			reception.movement = fDecoder->Decode(timestamp);
++		return reception;
++	}
++
++	MouseReportDecoder &Decoder() { return *fDecoder; }
++
++private:
++	HIDParser							fParser;
++	std::unique_ptr<MouseReportDecoder>	fDecoder;
++	Packet								fLastPacket;
++};
++
++
++// --- Minimal test runner ----------------------------------------------------
++
++static int sFailedChecks = 0;
++static int sFailedTests = 0;
++static int sPassedTests = 0;
++
++
++#define CHECK_EQUAL(expected, actual)										\
++	do {																	\
++		long long expectedValue = (expected);								\
++		long long actualValue = (actual);									\
++		if (expectedValue != actualValue) {									\
++			printf("    %s:%d: expected %s == %lld, got %lld\n", __FILE__,	\
++				__LINE__, #actual, expectedValue, actualValue);				\
++			sFailedChecks++;												\
++		}																	\
++	} while (false)
++
++#define CHECK_TRUE(condition)												\
++	do {																	\
++		if (!(condition)) {													\
++			printf("    %s:%d: expected %s\n", __FILE__, __LINE__,			\
++				#condition);												\
++			sFailedChecks++;												\
++		}																	\
++	} while (false)
++
++#define RUN_TEST(test)														\
++	do {																	\
++		int failedBefore = sFailedChecks;									\
++		test();																\
++		if (sFailedChecks == failedBefore) {								\
++			printf("PASS  %s\n", #test);									\
++			sPassedTests++;													\
++		} else {															\
++			printf("FAIL  %s\n", #test);									\
++			sFailedTests++;													\
++		}																	\
++	} while (false)
++
++
++// --- Tests: mouse with everything in one report (behaviour must not change) --
++
++static void
++boot_mouse_reports_motion_and_buttons_from_one_packet()
++{
++	MouseFixture mouse(kBootMouseDescriptor, sizeof(kBootMouseDescriptor));
++
++	Reception reception = mouse.Receive(Packet{kLeftButton, 5, (uint8)-2});
++
++	CHECK_TRUE(reception.producedMovement);
++	CHECK_EQUAL(kLeftButton, reception.movement.buttons);
++	CHECK_EQUAL(5, reception.movement.xdelta);
++	CHECK_EQUAL(2, reception.movement.ydelta);
++		// the Y axis points down in the HID spec and up for the app server
++	CHECK_EQUAL(1, reception.movement.clicks);
++}
++
++
++static void
++boot_mouse_reports_release()
++{
++	MouseFixture mouse(kBootMouseDescriptor, sizeof(kBootMouseDescriptor));
++	mouse.Receive(Packet{kLeftButton, 0, 0});
++
++	Reception reception = mouse.Receive(Packet{0, 0, 0});
++
++	CHECK_EQUAL(0, reception.movement.buttons);
++	CHECK_EQUAL(0, reception.movement.clicks);
++}
++
++
++static void
++boot_mouse_counts_quick_second_press_as_double_click()
++{
++	MouseFixture mouse(kBootMouseDescriptor, sizeof(kBootMouseDescriptor));
++	mouse.Receive(Packet{kLeftButton, 0, 0}, 1000000);
++	mouse.Receive(Packet{0, 0, 0}, 1050000);
++
++	Reception reception = mouse.Receive(Packet{kLeftButton, 0, 0}, 1100000);
++
++	CHECK_EQUAL(2, reception.movement.clicks);
++}
++
++
++static void
++boot_mouse_restarts_click_count_after_the_click_speed()
++{
++	MouseFixture mouse(kBootMouseDescriptor, sizeof(kBootMouseDescriptor));
++	mouse.Decoder().SetClickSpeed(200000);
++	mouse.Receive(Packet{kLeftButton, 0, 0}, 1000000);
++	mouse.Receive(Packet{0, 0, 0}, 1050000);
++
++	Reception reception = mouse.Receive(Packet{kLeftButton, 0, 0}, 1300000);
++
++	CHECK_EQUAL(1, reception.movement.clicks);
++}
++
++
++// --- Tests: mouse with motion and buttons in different reports --------------
++
++static void
++cherry_motion_packet_reports_the_movement()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_motion_packet(10, -3));
++
++	CHECK_TRUE(reception.producedMovement);
++	CHECK_EQUAL(10, reception.movement.xdelta);
++	CHECK_EQUAL(3, reception.movement.ydelta);
++	CHECK_EQUAL(0, reception.movement.buttons);
++}
++
++
++static void
++cherry_motion_packet_reports_full_twelve_bit_range()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_motion_packet(-2047, 2047));
++
++	CHECK_EQUAL(-2047, reception.movement.xdelta);
++	CHECK_EQUAL(-2047, reception.movement.ydelta);
++}
++
++
++static void
++cherry_button_packet_reports_a_pressed_button()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(kLeftButton));
++
++	CHECK_TRUE(reception.producedMovement);
++	CHECK_EQUAL(kLeftButton, reception.movement.buttons);
++	CHECK_EQUAL(1, reception.movement.clicks);
++	CHECK_EQUAL(0, reception.movement.xdelta);
++	CHECK_EQUAL(0, reception.movement.ydelta);
++}
++
++
++static void
++cherry_right_button_is_reported_as_the_second_button()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(kRightButton));
++
++	CHECK_EQUAL(kRightButton, reception.movement.buttons);
++}
++
++
++static void
++cherry_button_stays_pressed_while_the_mouse_moves()
++{
++	// This is what dragging a window looks like.
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++	mouse.Receive(cherry_buttons_packet(kLeftButton));
++
++	Reception reception = mouse.Receive(cherry_motion_packet(4, 0));
++
++	CHECK_EQUAL(kLeftButton, reception.movement.buttons);
++	CHECK_EQUAL(4, reception.movement.xdelta);
++}
++
++
++static void
++cherry_button_release_is_reported()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++	mouse.Receive(cherry_buttons_packet(kLeftButton));
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(0));
++
++	CHECK_TRUE(reception.producedMovement);
++	CHECK_EQUAL(0, reception.movement.buttons);
++	CHECK_EQUAL(0, reception.movement.clicks);
++}
++
++
++static void
++cherry_wheel_packet_reports_the_wheel()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(0, 1, 0));
++
++	CHECK_TRUE(reception.producedMovement);
++	CHECK_EQUAL(-1, reception.movement.wheel_ydelta);
++	CHECK_EQUAL(0, reception.movement.wheel_xdelta);
++}
++
++
++static void
++cherry_horizontal_pan_is_reported()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(0, 0, -1));
++
++	CHECK_EQUAL(-1, reception.movement.wheel_xdelta);
++}
++
++
++static void
++cherry_wheel_is_not_repeated_by_the_next_motion_packet()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++	mouse.Receive(cherry_buttons_packet(0, 1, 0));
++
++	Reception reception = mouse.Receive(cherry_motion_packet(1, 1));
++
++	CHECK_EQUAL(0, reception.movement.wheel_ydelta);
++}
++
++
++static void
++cherry_two_quick_presses_are_a_double_click()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++	mouse.Receive(cherry_buttons_packet(kLeftButton), 1000000);
++	mouse.Receive(cherry_buttons_packet(0), 1050000);
++
++	Reception reception = mouse.Receive(cherry_buttons_packet(kLeftButton),
++		1100000);
++
++	CHECK_EQUAL(2, reception.movement.clicks);
++}
++
++
++static void
++cherry_vendor_packet_produces_no_movement()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++	mouse.Receive(cherry_buttons_packet(kLeftButton));
++
++	Reception reception = mouse.Receive(cherry_vendor_packet());
++
++	CHECK_TRUE(!reception.producedMovement);
++}
++
++
++static void
++cherry_too_short_buttons_packet_produces_no_movement()
++{
++	MouseFixture mouse(kCherryMouseDescriptor, sizeof(kCherryMouseDescriptor));
++
++	// The buttons report holds three bytes of data, this packet only one.
++	Reception reception = mouse.Receive(Packet{kCherryButtonsReportID, 0x01});
++
++	CHECK_TRUE(!reception.producedMovement);
++}
++
++
++static void
++button_value_outside_its_range_counts_as_released()
++{
++	MouseFixture mouse(kTwoBitButtonsDescriptor,
++		sizeof(kTwoBitButtonsDescriptor));
++	Reception pressed = mouse.Receive(Packet{0x01, 0, 0});
++	CHECK_EQUAL(kLeftButton, pressed.movement.buttons);
++
++	// The logical maximum of a button is 1, so the value 3 is not valid.
++	Reception invalid = mouse.Receive(Packet{0x03, 0, 0});
++
++	CHECK_EQUAL(0, invalid.movement.buttons);
++}
++
++
++int
++main()
++{
++	printf("mouse with everything in one report\n");
++	RUN_TEST(boot_mouse_reports_motion_and_buttons_from_one_packet);
++	RUN_TEST(boot_mouse_reports_release);
++	RUN_TEST(boot_mouse_counts_quick_second_press_as_double_click);
++	RUN_TEST(boot_mouse_restarts_click_count_after_the_click_speed);
++
++	printf("mouse with motion and buttons in different reports\n");
++	RUN_TEST(cherry_motion_packet_reports_the_movement);
++	RUN_TEST(cherry_motion_packet_reports_full_twelve_bit_range);
++	RUN_TEST(cherry_button_packet_reports_a_pressed_button);
++	RUN_TEST(cherry_right_button_is_reported_as_the_second_button);
++	RUN_TEST(cherry_button_stays_pressed_while_the_mouse_moves);
++	RUN_TEST(cherry_button_release_is_reported);
++	RUN_TEST(cherry_wheel_packet_reports_the_wheel);
++	RUN_TEST(cherry_horizontal_pan_is_reported);
++	RUN_TEST(cherry_wheel_is_not_repeated_by_the_next_motion_packet);
++	RUN_TEST(cherry_two_quick_presses_are_a_double_click);
++	RUN_TEST(cherry_vendor_packet_produces_no_movement);
++	RUN_TEST(cherry_too_short_buttons_packet_produces_no_movement);
++
++	printf("mouse buttons with values outside their range\n");
++	RUN_TEST(button_value_outside_its_range_counts_as_released);
++
++	printf("\n%d passed, %d failed\n", sPassedTests, sFailedTests);
++	return sFailedTests == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

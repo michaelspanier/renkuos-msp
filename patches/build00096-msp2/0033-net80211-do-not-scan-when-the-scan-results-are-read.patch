@@ -1,0 +1,150 @@
+From 8cca8960767612f020837adc47f1273cac2ddc2d Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 17:58:41 +0000
+Subject: [PATCH 33/34] net80211: do not scan when the scan results are read
+
+Reading IEEE80211_IOC_SCAN_RESULTS starts a background scan. The glue
+answers it with SIOCG80211ALLNODES, which ends with
+
+	if (suser(curproc) == 0)
+		ieee80211_begin_bgscan(ifp);
+
+suser() is true for every caller on Haiku, so each reader of the
+results scans: ifconfig list, the Network preferences, the Deskbar
+replicant and any monitor polling the signal. A background scan of
+the iwm takes about six seconds; it leaves the channel for up to
+120 ms at a time, and frames for us wait at the AP meanwhile. Polled
+once a second, the interface is scanning most of the time, and a
+third of the pings to the router take 30 to 125 ms instead of 2 ms.
+The scan also flushes the node table, so the reader sees an
+incomplete list.
+
+Leave the scan out of SIOCG80211ALLNODES on Haiku and start it from
+IEEE80211_IOC_SCAN_REQ instead, which until now only reported whether
+a scan was running. While associated it starts a background scan;
+in any other state the stack scans on its own, as before.
+
+The Deskbar replicant and the Network preferences relied on reading
+to refresh the list while connected. The replicant now asks for a
+scan when its menu opens, the preferences every 30 s while connected.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ src/apps/networkstatus/NetworkStatusView.cpp           |  3 +++
+ .../compat/openbsd_wlan/net80211/ieee80211_haiku.cpp   |  9 +++++++--
+ .../compat/openbsd_wlan/net80211/ieee80211_ioctl.c     |  8 ++++++++
+ src/preferences/network/InterfaceView.cpp              | 10 +++++++++-
+ src/preferences/network/InterfaceView.h                |  1 +
+ 5 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/apps/networkstatus/NetworkStatusView.cpp b/src/apps/networkstatus/NetworkStatusView.cpp
+index e3dce1ac2b..f433d0df90 100644
+--- a/src/apps/networkstatus/NetworkStatusView.cpp
++++ b/src/apps/networkstatus/NetworkStatusView.cpp
+@@ -410,6 +410,9 @@ NetworkStatusView::MouseDown(BPoint point)
+ 		uint32 networksCount = 0;
+ 		wireless_network* networks = NULL;
+ 		device.GetNetworks(networks, networksCount);
++		// Reading the networks does not scan; look again for the next time
++		// the menu opens.
++		device.Scan(false, false);
+ 		networksCount = WirelessNetworkMenuItem::MergeSameName(networks,
+ 			networksCount, associated);
+ 		for (uint32 i = 0; i < networksCount; i++) {
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_haiku.cpp b/src/libs/compat/openbsd_wlan/net80211/ieee80211_haiku.cpp
+index b3fc2ddd1a..615faf4d4e 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_haiku.cpp
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_haiku.cpp
+@@ -189,13 +189,18 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
+ 			if (op != SIOCS80211)
+ 				return B_BAD_VALUE;
+ 
+-			// SIOCS80211SCAN is a no-op, scans cannot actually be initiated.
+-			// But we can at least check if one is already in progress.
++			// SIOCS80211SCAN is a no-op. While associated, start a background
++			// scan; otherwise the stack scans on its own anyway.
+ 			status_t status = EBUSY;
+ 
+ 			IFF_LOCKGIANT(ifp);
+ 			if (ic->ic_state == IEEE80211_S_SCAN || (ic->ic_flags & IEEE80211_F_BGSCAN) != 0)
+ 				status = EINPROGRESS;
++			else if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state == IEEE80211_S_RUN) {
++				ieee80211_begin_bgscan(ifp);
++				if ((ic->ic_flags & IEEE80211_F_BGSCAN) != 0)
++					status = B_OK;
++			}
+ 			IFF_UNLOCKGIANT(ifp);
+ 
+ 			return status;
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_ioctl.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_ioctl.c
+index 670fbf236d..9887093371 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_ioctl.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_ioctl.c
+@@ -964,8 +964,16 @@ ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
+ 			na->na_nodes++;
+ 			ni = RBT_NEXT(ieee80211_tree, ni);
+ 		}
++#ifndef __HAIKU__
+ 		if (suser(curproc) == 0)
+ 			ieee80211_begin_bgscan(ifp);
++#else
++		/*
++		 * Everybody is root here, and the Haiku glue reads the nodes
++		 * one at a time: every reader of the scan results would start
++		 * a background scan. IEEE80211_IOC_SCAN_REQ starts one.
++		 */
++#endif
+ 		break;
+ 	case SIOCG80211FLAGS:
+ 		flags = ic->ic_userflags;
+diff --git a/src/preferences/network/InterfaceView.cpp b/src/preferences/network/InterfaceView.cpp
+index e7cfdc5e66..e356ee08b7 100644
+--- a/src/preferences/network/InterfaceView.cpp
++++ b/src/preferences/network/InterfaceView.cpp
+@@ -32,6 +32,7 @@
+ static const uint32 kMsgInterfaceToggle = 'onof';
+ static const uint32 kMsgInterfaceRenegotiate = 'redo';
+ static const uint32 kMsgJoinNetwork = 'join';
++static const bigtime_t kRescanInterval = 30000000;
+ 
+ 
+ /*!	Match by SSID (BSSID only for hidden networks), not
+@@ -57,7 +58,8 @@ same_network(const wireless_network& a, const wireless_network& b)
+ InterfaceView::InterfaceView()
+ 	:
+ 	BGroupView(B_VERTICAL),
+-	fPulseCount(0)
++	fPulseCount(0),
++	fLastScan(0)
+ {
+ 	SetFlags(Flags() | B_PULSE_NEEDED);
+ 
+@@ -304,6 +306,12 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 			snooze(50 * 1000);
+ 
+ 			device.GetNetworks(networks, networksCount);
++		} else if (!associated.empty()
++			&& system_time() - fLastScan >= kRescanInterval) {
++			// Reading the networks does not scan while connected; look
++			// again now and then, the next update shows what was found.
++			device.Scan(false, false);
++			fLastScan = system_time();
+ 		}
+ 
+ 		ArrayDeleter<wireless_network> networksDeleter(networks);
+diff --git a/src/preferences/network/InterfaceView.h b/src/preferences/network/InterfaceView.h
+index 977609b780..6df7ff264d 100644
+--- a/src/preferences/network/InterfaceView.h
++++ b/src/preferences/network/InterfaceView.h
+@@ -39,6 +39,7 @@ private:
+ private:
+ 			BNetworkInterface	fInterface;
+ 			int					fPulseCount;
++			bigtime_t			fLastScan;
+ 
+ 			BStringView*		fStatusField;
+ 			BStringView*		fMacAddressField;
+-- 
+2.54.1
+

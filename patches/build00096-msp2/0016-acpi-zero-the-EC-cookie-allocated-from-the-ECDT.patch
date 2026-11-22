@@ -1,0 +1,44 @@
+From e6fd834d7367ea0abad03fcfe513653ccb0e17c6 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 22:56:06 +0000
+Subject: [PATCH 16/34] acpi: zero the EC cookie allocated from the ECDT
+
+embedded_controller_probe_ecdt() allocated the cookie with malloc()
+and set only some fields; init_driver() clears its cookie with
+memset(). With a kernel heap that fills new blocks with 0xcc
+(KDEBUG_LEVEL 2), ec_sci_pending started at 0xcccccccc, so
+EcGpeHandler() never queued a query: no _Qxx method ran and no
+Notify reached the lid, AC adapter or battery devices.
+
+Use calloc() like the other path does.
+
+Tested on a ThinkPad T470s, which has an ECDT: lid and AC adapter
+changes now reach acpi_lid and acpi_ac within a second, the SCI
+rate dropped from about 380/s to about 35/s, and the lid handling
+of the power_daemon from #530 works.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZxbWGYWmZfrWCoDt1wNjX
+(cherry picked from commit 8cea83936a86e0b4100c9870b4f6e54c8c61da6b)
+---
+ src/add-ons/kernel/bus_managers/acpi/EmbeddedController.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/acpi/EmbeddedController.cpp b/src/add-ons/kernel/bus_managers/acpi/EmbeddedController.cpp
+index 9377e81f13..f72d748409 100644
+--- a/src/add-ons/kernel/bus_managers/acpi/EmbeddedController.cpp
++++ b/src/add-ons/kernel/bus_managers/acpi/EmbeddedController.cpp
+@@ -343,7 +343,7 @@ embedded_controller_probe_ecdt()
+ 	if (ACPI_FAILURE(status))
+ 		return;
+ 
+-	acpi_ec_cookie* sc = (acpi_ec_cookie*)malloc(sizeof(acpi_ec_cookie));
++	acpi_ec_cookie* sc = (acpi_ec_cookie*)calloc(1, sizeof(acpi_ec_cookie));
+ 	if (sc == NULL)
+ 		return;
+ 
+-- 
+2.54.1
+

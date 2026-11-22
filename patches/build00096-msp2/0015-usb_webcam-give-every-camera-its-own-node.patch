@@ -1,0 +1,482 @@
+From 7de5d6b7af91c0dd75e7ac53aa1892bfa58fbba1 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 16:01:59 +0000
+Subject: [PATCH 15/34] usb_webcam: give every camera its own node
+
+With two cameras plugged in, only the first one could be used. The flavor
+was not global, so an application that instantiated it loaded the add-on
+itself, counted the cameras anew and got internal ids that did not match
+the flavor it had asked for. The producer also allowed only one instance
+for the whole add-on.
+
+Mark the flavor B_FLAVOR_IS_GLOBAL so the node lives in the
+media_addon_server, and drop the instance counter: each camera has its
+own flavor with possible_count 1, so the media kit already makes at most
+one node per camera. The add-on keeps a list of its nodes and tells each
+of them when a camera is plugged in.
+
+A camera plugged in again used to get a new internal id, so the media
+server made a second node for it and the old one was left without a
+camera. CamFlavorIds remembers the ids of unplugged cameras by name and
+gives the old id back. Tests in CamFlavorIdsTest.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FZxbWGYWmZfrWCoDt1wNjX
+(cherry picked from commit 80cffda0a872f937d8e1c4606077dc7c05f564ea)
+---
+ .../media/media-add-ons/usb_webcam/AddOn.cpp  |  42 ++++--
+ .../media/media-add-ons/usb_webcam/AddOn.h    |   7 +-
+ .../media-add-ons/usb_webcam/CamDevice.cpp    |   1 +
+ .../media-add-ons/usb_webcam/CamFlavorIds.h   |  97 ++++++++++++++
+ .../media-add-ons/usb_webcam/Producer.cpp     |   8 --
+ .../media/media-add-ons/usb_webcam/Producer.h |   1 -
+ .../media/usb_webcam/CamFlavorIdsTest.cpp     | 124 ++++++++++++++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   1 +
+ 8 files changed, 258 insertions(+), 23 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/CamFlavorIds.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/CamFlavorIdsTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
+index 6083040e5f..8452e9e30b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
+@@ -20,7 +20,6 @@
+ WebCamMediaAddOn::WebCamMediaAddOn(image_id imid)
+ 	: BMediaAddOn(imid),
+ 	fNodeLock("webcam node"),
+-	fNode(NULL),
+ 	fInitStatus(B_NO_INIT),
+ 	fRoster(NULL)
+ {
+@@ -143,9 +142,8 @@ WebCamMediaAddOn::InstantiateNodeFor(
+ 		*out_info = cam->FlavorInfo();
+ 	fRoster->Unlock();
+ #endif
+-	/* At most one instance of the node should be instantiated at any given
+-	 * time. The locking for this restriction may be found in the VideoProducer
+-	 * class. */
++	/* Each camera has its own flavor with possible_count 1, so the media kit
++	 * makes at most one node per camera. */
+ 	node = new VideoProducer(this, cam, cam->FlavorInfo()->name, cam->FlavorInfo()->internal_id);
+ 	if (node && (node->InitCheck() < B_OK)) {
+ 		delete node;
+@@ -154,7 +152,7 @@ WebCamMediaAddOn::InstantiateNodeFor(
+ 
+ 	if (node != NULL) {
+ 		BAutolock lock(fNodeLock);
+-		fNode = node;
++		fNodes.AddItem(node);
+ 	}
+ 	return node;
+ }
+@@ -165,11 +163,11 @@ WebCamMediaAddOn::CameraAdded(CamDevice* device)
+ {
+ 	PRINT((CH "()" CT));
+ 	{
+-		// The node may have lost its camera, and this may be that camera
+-		// plugged in again.
++		// A node may have lost its camera, and this may be that camera
++		// plugged in again. Each node checks whether it is its own.
+ 		BAutolock lock(fNodeLock);
+-		if (fNode != NULL)
+-			fNode->CameraPluggedIn();
++		for (int32 i = 0; i < fNodes.CountItems(); i++)
++			static_cast<VideoProducer*>(fNodes.ItemAt(i))->CameraPluggedIn();
+ 	}
+ 	NotifyFlavorChange();
+ 	return B_OK;
+@@ -180,6 +178,11 @@ status_t
+ WebCamMediaAddOn::CameraRemoved(CamDevice* device)
+ {
+ 	PRINT((CH "()" CT));
++	{
++		BAutolock lock(fNodeLock);
++		fFlavorIds.Remember(device->FlavorInfo()->name,
++			device->FlavorInfo()->internal_id);
++	}
+ 	NotifyFlavorChange();
+ 	return B_OK;
+ }
+@@ -189,8 +192,7 @@ void
+ WebCamMediaAddOn::NodeDeleted(VideoProducer* node)
+ {
+ 	BAutolock lock(fNodeLock);
+-	if (fNode == node)
+-		fNode = NULL;
++	fNodes.RemoveItem(node);
+ }
+ 
+ 
+@@ -217,9 +219,12 @@ WebCamMediaAddOn::FillDefaultFlavorInfo(flavor_info* info)
+ 	info->name = (char *)"USB Web Camera";
+ 	info->info = (char *)"USB Web Camera";
+ 	info->kinds = B_BUFFER_PRODUCER | B_CONTROLLABLE | B_PHYSICAL_INPUT;
+-	info->flavor_flags = 0;//B_FLAVOR_IS_GLOBAL;
++	// The node must live in the media_addon_server: an application that
++	// loaded this add-on itself would count the cameras anew, and its
++	// internal ids would not match the flavor it asked for.
++	info->flavor_flags = B_FLAVOR_IS_GLOBAL;
+ 	info->internal_id = atomic_add((int32*)&fInternalIDCounter, 1);
+-	info->possible_count = 1;//0;
++	info->possible_count = 1;
+ 	info->in_format_count = 0;
+ 	info->in_format_flags = 0;
+ 	info->in_formats = NULL;
+@@ -229,6 +234,17 @@ WebCamMediaAddOn::FillDefaultFlavorInfo(flavor_info* info)
+ }
+ 
+ 
++/*!	Gives a camera plugged in again the id it had before; see CamFlavorIds.
++	Call it once the camera has its name.
++*/
++void
++WebCamMediaAddOn::TakeFlavorId(flavor_info* info)
++{
++	BAutolock lock(fNodeLock);
++	info->internal_id = fFlavorIds.Take(info->name, info->internal_id);
++}
++
++
+ BMediaAddOn *
+ make_media_addon(image_id id)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
+index a469097257..8bc5183329 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
+@@ -6,8 +6,11 @@
+ #define _VIDEO_ADDON_H
+ 
+ #include <media/MediaAddOn.h>
++#include <support/List.h>
+ #include <support/Locker.h>
+ 
++#include "CamFlavorIds.h"
++
+ #define TOUCH(x) ((void)(x))
+ 
+ extern "C" _EXPORT BMediaAddOn *make_media_addon(image_id you);
+@@ -45,13 +48,15 @@ public:
+ 		status_t		CameraAdded(CamDevice* device);
+ 		status_t		CameraRemoved(CamDevice* device);
+ 		void			FillDefaultFlavorInfo(flavor_info* info);
++		void			TakeFlavorId(flavor_info* info);
+ 		// for the node
+ 		void			NodeDeleted(VideoProducer* node);
+ 		CamDevice*		PluggedCameraNamed(const char* name);
+ 
+ private:
+ 	BLocker				fNodeLock;
+-	VideoProducer*		fNode;
++	BList				fNodes;
++	CamFlavorIds		fFlavorIds;
+ 	uint32				fInternalIDCounter;
+ 	status_t			fInitStatus;
+ 	flavor_info			fDefaultFlavorInfo;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 46ad07837e..7b5c81364a 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -72,6 +72,7 @@ CamDevice::CamDevice(CamDeviceAddon &_addon, BUSBDevice* _device)
+ 		fFlavorInfoNameStr = deviceName;
+ 		fFlavorInfo.name = fFlavorInfoNameStr.String();
+ 	}
++	_addon.WebCamAddOn()->TakeFlavorId(&fFlavorInfo);
+ #ifdef DEBUG_WRITE_DUMP
+ 	fDumpFD = open("/boot/home/webcam.out", O_CREAT|O_RDWR, 0644);
+ #endif
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamFlavorIds.h b/src/add-ons/media/media-add-ons/usb_webcam/CamFlavorIds.h
+new file mode 100644
+index 0000000000..509ab21ed6
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamFlavorIds.h
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef CAM_FLAVOR_IDS_H
++#define CAM_FLAVOR_IDS_H
++
++
++#include <stddef.h>
++#include <string.h>
++
++
++/*!	Remembers the flavor ids of unplugged cameras. A camera plugged in again
++	gets its old id back, so the node that streamed from it takes it over and
++	the media server does not make a second node for the same camera.
++	The caller locks.
++*/
++struct cam_flavor_entry {
++			char				name[64];
++			int					id;
++};
++
++
++class CamFlavorIds {
++public:
++	static	const int			kMaxRemembered = 8;
++
++								CamFlavorIds();
++
++			int					Take(const char* name, int freshId);
++			void				Remember(const char* name, int id);
++
++private:
++			void				_RemoveAt(int index);
++
++			cam_flavor_entry	fEntries[kMaxRemembered];
++			int					fCount;
++};
++
++
++inline
++CamFlavorIds::CamFlavorIds()
++	:
++	fCount(0)
++{
++}
++
++
++/*!	Returns the remembered id of a camera with this name and forgets it,
++	or \a freshId when there is none.
++*/
++inline int
++CamFlavorIds::Take(const char* name, int freshId)
++{
++	if (name == NULL)
++		return freshId;
++
++	for (int i = 0; i < fCount; i++) {
++		if (strcmp(fEntries[i].name, name) != 0)
++			continue;
++		int id = fEntries[i].id;
++		_RemoveAt(i);
++		return id;
++	}
++	return freshId;
++}
++
++
++/*!	Keeps the id of an unplugged camera. When the table is full, the oldest
++	entry goes.
++*/
++inline void
++CamFlavorIds::Remember(const char* name, int id)
++{
++	if (name == NULL)
++		return;
++
++	if (fCount == kMaxRemembered)
++		_RemoveAt(0);
++	strlcpy(fEntries[fCount].name, name, sizeof(fEntries[fCount].name));
++	fEntries[fCount].id = id;
++	fCount++;
++}
++
++
++inline void
++CamFlavorIds::_RemoveAt(int index)
++{
++	memmove(&fEntries[index], &fEntries[index + 1],
++		(fCount - index - 1) * sizeof(cam_flavor_entry));
++	fCount--;
++}
++
++
++#endif	// CAM_FLAVOR_IDS_H
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index b5c2e85748..908badf8fb 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -58,9 +58,6 @@ static const int32 kMsgConsumerGone = 'Cgon';
+ static const int32 kMsgCameraPluggedIn = 'Cplg';
+ 
+ 
+-int32 VideoProducer::fInstances = 0;
+-
+-
+ VideoProducer::VideoProducer(
+ 		BMediaAddOn *addon, CamDevice *dev, const char *name, int32 internal_id)
+ 	: BMediaNode(name),
+@@ -72,10 +69,6 @@ VideoProducer::VideoProducer(
+ 
+ 	fInitStatus = B_NO_INIT;
+ 
+-	/* Only allow one instance of the node to exist at any time */
+-	if (atomic_add(&fInstances, 1) != 0)
+-		return;
+-
+ 	fInternalID = internal_id;
+ 	fAddOn = addon;
+ 	fCamDevice = dev;
+@@ -116,7 +109,6 @@ VideoProducer::~VideoProducer()
+ 			HandleStop();
+ 	}
+ 
+-	atomic_add(&fInstances, -1);
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+index fc31d5f374..01f386fd22 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+@@ -127,7 +127,6 @@ private:
+ 		status_t			_SetResolution(const void* value, size_t size);
+ 		void				_TakeCameraBack();
+ 
+-static	int32				fInstances;
+ 
+ 		status_t			fInitStatus;
+ 
+diff --git a/src/tests/add-ons/media/usb_webcam/CamFlavorIdsTest.cpp b/src/tests/add-ons/media/usb_webcam/CamFlavorIdsTest.cpp
+new file mode 100644
+index 0000000000..17243e2d11
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/CamFlavorIdsTest.cpp
+@@ -0,0 +1,124 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "CamFlavorIds.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_new_camera_gets_the_fresh_id()
++{
++	CamFlavorIds ids;
++	CHECK(ids.Take("HD Pro Webcam C920", 5) == 5);
++}
++
++
++static void
++test_camera_plugged_in_again_gets_its_old_id()
++{
++	// Its node is still there and waits for it; a new id would make a
++	// second node for the same camera.
++	CamFlavorIds ids;
++	ids.Remember("HD Pro Webcam C920", 1);
++	CHECK(ids.Take("HD Pro Webcam C920", 3) == 1);
++}
++
++
++static void
++test_old_id_is_given_only_once()
++{
++	CamFlavorIds ids;
++	ids.Remember("HD Pro Webcam C920", 1);
++	ids.Take("HD Pro Webcam C920", 3);
++	CHECK(ids.Take("HD Pro Webcam C920", 4) == 4);
++}
++
++
++static void
++test_other_camera_gets_a_fresh_id_and_leaves_the_old_one()
++{
++	CamFlavorIds ids;
++	ids.Remember("HD Pro Webcam C920", 1);
++	CHECK(ids.Take("Integrated Camera", 3) == 3);
++	CHECK(ids.Take("HD Pro Webcam C920", 4) == 1);
++}
++
++
++static void
++test_two_cameras_of_one_model_get_both_ids_back()
++{
++	CamFlavorIds ids;
++	ids.Remember("HD Pro Webcam C920", 1);
++	ids.Remember("HD Pro Webcam C920", 2);
++	CHECK(ids.Take("HD Pro Webcam C920", 7) == 1);
++	CHECK(ids.Take("HD Pro Webcam C920", 8) == 2);
++	CHECK(ids.Take("HD Pro Webcam C920", 9) == 9);
++}
++
++
++static void
++test_full_table_forgets_the_oldest()
++{
++	CamFlavorIds ids;
++	char name[16];
++	for (int i = 0; i <= CamFlavorIds::kMaxRemembered; i++) {
++		snprintf(name, sizeof(name), "camera %d", i);
++		ids.Remember(name, i + 1);
++	}
++	CHECK(ids.Take("camera 0", 99) == 99);
++	snprintf(name, sizeof(name), "camera %d", CamFlavorIds::kMaxRemembered);
++	CHECK(ids.Take(name, 99) == CamFlavorIds::kMaxRemembered + 1);
++}
++
++
++static void
++test_missing_name_is_never_remembered()
++{
++	CamFlavorIds ids;
++	ids.Remember(NULL, 1);
++	CHECK(ids.Take(NULL, 3) == 3);
++	CHECK(ids.Take("HD Pro Webcam C920", 4) == 4);
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_new_camera_gets_the_fresh_id);
++	RUN(test_camera_plugged_in_again_gets_its_old_id);
++	RUN(test_old_id_is_given_only_once);
++	RUN(test_other_camera_gets_a_fresh_id_and_leaves_the_old_one);
++	RUN(test_two_cameras_of_one_model_get_both_ids_back);
++	RUN(test_full_table_forgets_the_oldest);
++	RUN(test_missing_name_is_never_remembered);
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index 9a538a3052..26ffc0a5e6 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -4,6 +4,7 @@ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
+ 
+ SimpleTest CamDeviceNameTest : CamDeviceNameTest.cpp ;
++SimpleTest CamFlavorIdsTest : CamFlavorIdsTest.cpp ;
+ SimpleTest CamReplugTest : CamReplugTest.cpp ;
+ SimpleTest CamVideoSizeTest : CamVideoSizeTest.cpp ;
+ SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
+-- 
+2.54.1
+

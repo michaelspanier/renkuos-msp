@@ -1,0 +1,69 @@
+From 785f56b2eac84cd357ab3f7ae093f7f9626b6295 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 10:32:44 +0000
+Subject: [PATCH 24/34] media_server: send notifications without holding the
+ lock
+
+msp: from HaikiDevKI's patch 4-media_server.patch, not in any PR.
+---
+ src/servers/media/NotificationManager.cpp | 26 ++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/media/NotificationManager.cpp b/src/servers/media/NotificationManager.cpp
+index 28e3051f7a..4b83aa0900 100644
+--- a/src/servers/media/NotificationManager.cpp
++++ b/src/servers/media/NotificationManager.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "NotificationManager.h"
+ 
++#include <new>
+ #include <string.h>
+ 
+ #include <Autolock.h>
+@@ -192,10 +193,23 @@ NotificationManager::SendNotifications(BMessage *msg)
+ 
+ 	TRACE("NotificationManager::SendNotifications what %#lx\n", what);
+ 
+-	BAutolock _(fLocker);
++	// Collect the receivers under the lock, send without it. Each send may
++	// take TIMEOUT when a receiver does not read its port, and CleanupTeam(),
++	// which the main thread calls whenever a team quits, needs the same lock:
++	// one stuck receiver used to stall the whole media_server, quit included.
++	fLocker.Lock();
++	int32 capacity = fNotificationList.CountItems();
++	BMessenger* receivers = new(std::nothrow) BMessenger[capacity];
++	if (receivers == NULL) {
++		fLocker.Unlock();
++		ERROR("NotificationManager::SendNotifications: out of memory\n");
++		return;
++	}
++	int32 count = 0;
+ 
+ 	Notification *n;
+-	for (fNotificationList.Rewind(); fNotificationList.GetNext(&n); ) {
++	for (fNotificationList.Rewind(); fNotificationList.GetNext(&n)
++			&& count < capacity; ) {
+ 		if (n->what != B_MEDIA_WILDCARD && n->what != what)
+ 			continue;
+ 		
+@@ -253,9 +267,15 @@ NotificationManager::SendNotifications(BMessage *msg)
+ 				break;
+ 		}
+ 
++		receivers[count++] = n->messenger;
++	}
++	fLocker.Unlock();
++
++	for (int32 i = 0; i < count; i++) {
+ 		TRACE("NotificationManager::SendNotifications sending\n");
+-		n->messenger.SendMessage(msg, static_cast<BHandler *>(NULL), TIMEOUT);
++		receivers[i].SendMessage(msg, static_cast<BHandler *>(NULL), TIMEOUT);
+ 	}
++	delete[] receivers;
+ }
+ 	
+ 
+-- 
+2.54.1
+

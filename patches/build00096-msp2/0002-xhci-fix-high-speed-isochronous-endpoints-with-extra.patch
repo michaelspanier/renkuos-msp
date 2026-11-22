@@ -1,0 +1,313 @@
+From 969a2066e56932f20078f7a9a5614623369d15e1 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Fri, 20 Nov 2026 06:37:45 +0000
+Subject: [PATCH 02/34] xhci: fix high speed isochronous endpoints with extra
+ transactions
+
+High speed isochronous endpoints that move more than one packet per
+microframe (bits 11 and 12 of wMaxPacketSize) did not work. A UVC
+camera only gave a picture at its smallest sizes.
+
+- ConfigureEndpoint took the whole wMaxPacketSize as the packet size.
+  The controller computed too much bandwidth and refused the endpoint.
+- The TBC and TLBPC fields of isochronous TRBs stayed zero, so the
+  controller expected a single packet per interval.
+- _InsertEndpointForPipe ignored a refused Configure Endpoint, and
+  transfers on that pipe then waited forever.
+
+Mask the packet size, fill in the burst fields the way Linux does,
+and return the error so that transfers fail at once. The burst
+calculation is in xhci_isochronous.h and has a unit test.
+
+SuperSpeed Plus Mult is still not handled; I have no such device.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 2fc51456e398477a450af935aaf4ee1493f127c4)
+---
+ src/add-ons/kernel/busses/usb/xhci.cpp        |  35 ++++-
+ .../kernel/busses/usb/xhci_isochronous.h      |  50 +++++++
+ src/tests/add-ons/kernel/busses/usb/Jamfile   |   3 +
+ .../kernel/busses/usb/XhciIsochronousTest.cpp | 135 ++++++++++++++++++
+ 4 files changed, 220 insertions(+), 3 deletions(-)
+ create mode 100644 src/add-ons/kernel/busses/usb/xhci_isochronous.h
+ create mode 100644 src/tests/add-ons/kernel/busses/usb/XhciIsochronousTest.cpp
+
+diff --git a/src/add-ons/kernel/busses/usb/xhci.cpp b/src/add-ons/kernel/busses/usb/xhci.cpp
+index 3907795e8c..3ecdbe4201 100644
+--- a/src/add-ons/kernel/busses/usb/xhci.cpp
++++ b/src/add-ons/kernel/busses/usb/xhci.cpp
+@@ -26,6 +26,7 @@
+ #include <vm/vm.h>
+ 
+ #include "xhci.h"
++#include "xhci_isochronous.h"
+ 
+ 
+ #define CALLED(x...)	TRACE_MODULE("CALLED %s\n", __PRETTY_FUNCTION__)
+@@ -1370,8 +1371,21 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
+ 			}
+ 		}
+ 
+-		// TODO: We do not currently take Mult into account at all!
+-		// How are we supposed to do that here?
++		// Tell the controller how many packets and bursts this interval's
++		// TRB moves, otherwise it takes it for a single packet and a camera
++		// that sends two or three per microframe gets errors.
++		const uint32 packetSize = xhci_isochronous_packet_size(maxPacketSize);
++		const uint32 burstPackets = packetSize != 0
++			? endpoint->max_burst_payload / packetSize : 1;
++		for (uint32 i = 0; i < isochronousData->packet_count; i++) {
++			uint32 burstCount, lastBurstPackets;
++			xhci_isochronous_burst(TRB_2_BYTES_GET(td->trbs[i].status),
++				packetSize, burstPackets, &burstCount, &lastBurstPackets);
++			td->trbs[i].flags |= TRB_3_TBC(burstCount)
++				| TRB_3_TLBPC(lastBurstPackets);
++		}
++
++		// TODO: Mult of SuperSpeed Plus endpoints is not handled.
+ 
+ 		// Determine the (starting) frame number: if ISO_ASAP is set,
+ 		// we are queueing this "right away", and so want to reset
+@@ -2361,7 +2375,18 @@ XHCI::_InsertEndpointForPipe(Pipe *pipe)
+ 		_WriteContext(&device->input_ctx->input.addFlags,
+ 			(1 << endpointNum) | (1 << 0));
+ 
+-		ConfigureEndpoint(device->input_ctx_addr, false, device->slot);
++		// The controller may refuse the endpoint, for example for lack of
++		// bandwidth. Without a controller cookie, transfers on this pipe fail
++		// right away instead of waiting for an endpoint that never runs.
++		status = ConfigureEndpoint(device->input_ctx_addr, false, device->slot);
++		if (status != B_OK) {
++			TRACE_ERROR("unable to enable endpoint %d: %s\n", id,
++				strerror(status));
++			endpointLocker.Unlock();
++			mutex_destroy(&endpoint->lock);
++			memset((void*)endpoint, 0, sizeof(xhci_endpoint));
++			return status;
++		}
+ 
+ 		TRACE("device: address 0x%x state 0x%08" B_PRIx32 "\n",
+ 			device->address, SLOT_3_SLOT_STATE_GET(_ReadContext(
+@@ -2637,6 +2662,10 @@ XHCI::ConfigureEndpoint(xhci_endpoint* ep, uint8 slot, uint8 number, uint8 type,
+ 	if (speed == USB_SPEED_HIGHSPEED && (type & (USB_OBJECT_INTERRUPT_PIPE
+ 			| USB_OBJECT_ISO_PIPE)) != 0) {
+ 		maxBurst = (maxPacketSize & 0x1800) >> 11;
++
++		// Bits 11 and 12 count the additional transactions, they are not
++		// part of the packet size. (USB 2.0 § 9.6.6.)
++		maxPacketSize &= 0x7ff;
+ 	} else if (speed < USB_SPEED_SUPERSPEED) {
+ 		maxBurst = 0;
+ 	}
+diff --git a/src/add-ons/kernel/busses/usb/xhci_isochronous.h b/src/add-ons/kernel/busses/usb/xhci_isochronous.h
+new file mode 100644
+index 0000000000..d9b39d30dd
+--- /dev/null
++++ b/src/add-ons/kernel/busses/usb/xhci_isochronous.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef XHCI_ISOCHRONOUS_H
++#define XHCI_ISOCHRONOUS_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++/*!	Bits 0 to 10 of wMaxPacketSize are the packet size, bits 11 and 12 the
++	number of additional transactions in the same microframe.
++	(USB 2.0 § 9.6.6.)
++*/
++static inline uint32_t
++xhci_isochronous_packet_size(uint32_t maxPacketSize)
++{
++	return maxPacketSize & 0x7ff;
++}
++
++
++/*!	Computes the two burst fields of an isochronous TRB that moves \a length
++	bytes (XHCI 1.2 § 4.11.2.3): the number of bursts minus one, and the
++	number of packets in the last burst minus one. \a burstPackets is the
++	number of packets of one burst.
++*/
++static inline void
++xhci_isochronous_burst(size_t length, uint32_t packetSize,
++	uint32_t burstPackets, uint32_t* burstCount, uint32_t* lastBurstPackets)
++{
++	*burstCount = 0;
++	*lastBurstPackets = 0;
++	if (packetSize == 0 || burstPackets == 0)
++		return;
++
++	size_t packets = (length + packetSize - 1) / packetSize;
++	if (packets == 0)
++		packets = 1;
++
++	size_t bursts = (packets + burstPackets - 1) / burstPackets;
++	*burstCount = (uint32_t)(bursts - 1);
++	*lastBurstPackets = (uint32_t)(packets - (bursts - 1) * burstPackets - 1);
++}
++
++
++#endif	// XHCI_ISOCHRONOUS_H
+diff --git a/src/tests/add-ons/kernel/busses/usb/Jamfile b/src/tests/add-ons/kernel/busses/usb/Jamfile
+index cebc140345..6c8c85efae 100644
+--- a/src/tests/add-ons/kernel/busses/usb/Jamfile
++++ b/src/tests/add-ons/kernel/busses/usb/Jamfile
+@@ -1,3 +1,6 @@
+ SubDir HAIKU_TOP src tests add-ons kernel busses usb ;
+ 
+ SimpleTest uhci_decode : uhci_decode.cpp ;
++
++SubDirHdrs $(HAIKU_TOP) src add-ons kernel busses usb ;
++SimpleTest XhciIsochronousTest : XhciIsochronousTest.cpp ;
+diff --git a/src/tests/add-ons/kernel/busses/usb/XhciIsochronousTest.cpp b/src/tests/add-ons/kernel/busses/usb/XhciIsochronousTest.cpp
+new file mode 100644
+index 0000000000..bd0194a5c8
+--- /dev/null
++++ b/src/tests/add-ons/kernel/busses/usb/XhciIsochronousTest.cpp
+@@ -0,0 +1,135 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "xhci_isochronous.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++//	The isochronous endpoint of the Lite-On camera (USB 04ca:7066) at its
++//	largest setting: 960 bytes and two extra transactions per microframe.
++
++
++static void
++test_one_packet_is_one_burst_with_one_packet()
++{
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(640, 640, 1, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 0);
++}
++
++
++static void
++test_three_full_packets_are_one_burst_of_three()
++{
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(2880, 960, 3, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 2);
++}
++
++
++static void
++test_two_full_packets_are_one_burst_of_two()
++{
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(1920, 960, 3, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 1);
++}
++
++
++static void
++test_a_short_last_packet_still_counts_as_a_packet()
++{
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(2000, 960, 3, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 2);
++}
++
++
++static void
++test_more_packets_than_one_burst_take_a_second_burst()
++{
++	// Endpoint without extra transactions: every packet is a burst of its own.
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(1920, 960, 1, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 1);
++	CHECK(lastBurstPackets == 0);
++}
++
++
++static void
++test_an_empty_packet_is_a_burst_with_one_packet()
++{
++	uint32_t burstCount, lastBurstPackets;
++	xhci_isochronous_burst(0, 960, 3, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 0);
++}
++
++
++static void
++test_a_packet_size_of_zero_does_not_divide_by_zero()
++{
++	uint32_t burstCount = 99, lastBurstPackets = 99;
++	xhci_isochronous_burst(2880, 0, 3, &burstCount, &lastBurstPackets);
++	CHECK(burstCount == 0);
++	CHECK(lastBurstPackets == 0);
++}
++
++
++static void
++test_packet_size_leaves_out_the_extra_transactions()
++{
++	// wMaxPacketSize 0x13c0: 960 bytes, two extra transactions.
++	CHECK(xhci_isochronous_packet_size(0x13c0) == 960);
++	CHECK(xhci_isochronous_packet_size(640) == 640);
++	CHECK(xhci_isochronous_packet_size(0x0a80) == 640);
++}
++
++
++#define RUN(test) \
++	do { \
++		int before = sFailures; \
++		test(); \
++		sTests++; \
++		printf("%s %s\n", sFailures == before ? "ok  " : "FAIL", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_one_packet_is_one_burst_with_one_packet);
++	RUN(test_three_full_packets_are_one_burst_of_three);
++	RUN(test_two_full_packets_are_one_burst_of_two);
++	RUN(test_a_short_last_packet_still_counts_as_a_packet);
++	RUN(test_more_packets_than_one_burst_take_a_second_burst);
++	RUN(test_an_empty_packet_is_a_burst_with_one_packet);
++	RUN(test_a_packet_size_of_zero_does_not_divide_by_zero);
++	RUN(test_packet_size_leaves_out_the_extra_transactions);
++
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

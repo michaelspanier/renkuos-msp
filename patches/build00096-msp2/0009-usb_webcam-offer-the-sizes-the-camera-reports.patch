@@ -1,0 +1,582 @@
+From 7af375e585641d2d10311d49965f3fbc47885eb6 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:27:42 +0000
+Subject: [PATCH 09/34] usb_webcam: offer the sizes the camera reports
+
+Applications had to guess which sizes a camera supports. The
+producer now publishes the camera's sizes as a B_RESOLUTION
+parameter, each item labelled with its frame rate, for example
+"1280 x 720 (30 fps)". Setting the parameter chooses the size for
+the next connection that does not ask for one; the value is checked
+against the camera's list, and a running stream is left alone.
+Connect() refuses sizes above 8192 pixels a side, so that the size
+of a buffer cannot overflow.
+
+CamDevice gets CountVideoSizes() and VideoSizeAt(); UVCCamDevice
+answers them from its frame descriptors. The packing of a size into
+the parameter value, the label and the size limit live in
+CamVideoSize.h and are covered by CamVideoSizeTest.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit f1cc4c42fcb9657a6070ecdd3aae5e1bd500f019)
+---
+ .../media-add-ons/usb_webcam/CamDevice.cpp    |  18 +++
+ .../media-add-ons/usb_webcam/CamDevice.h      |   3 +
+ .../media-add-ons/usb_webcam/CamVideoSize.h   |  90 ++++++++++++++
+ .../media-add-ons/usb_webcam/Producer.cpp     | 112 ++++++++++++++++-
+ .../media/media-add-ons/usb_webcam/Producer.h |  13 ++
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    |  23 ++++
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |   3 +
+ .../media/usb_webcam/CamVideoSizeTest.cpp     | 116 ++++++++++++++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   1 +
+ 9 files changed, 377 insertions(+), 2 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 09d1106376..0d5e8fea68 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -216,6 +216,24 @@ CamDevice::SuggestVideoFrame(uint32 &width, uint32 &height)
+ }
+ 
+ 
++int32
++CamDevice::CountVideoSizes() const
++{
++	return 0;
++}
++
++
++/*!	Tells the size at \a index of the list the camera offers, and its
++	frame interval in 100 ns (0 if unknown).
++*/
++bool
++CamDevice::VideoSizeAt(int32 index, uint32 &width, uint32 &height,
++	uint32 &interval) const
++{
++	return false;
++}
++
++
+ status_t
+ CamDevice::AcceptVideoFrame(uint32 &width, uint32 &height)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index eaadf8c486..daf9421ff8 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -65,6 +65,9 @@ class CamDevice {
+ 
+ 	virtual status_t	SuggestVideoFrame(uint32 &width, uint32 &height);
+ 	virtual status_t	AcceptVideoFrame(uint32 &width, uint32 &height);
++	virtual int32		CountVideoSizes() const;
++	virtual bool		VideoSizeAt(int32 index, uint32 &width, uint32 &height,
++							uint32 &interval) const;
+ 	virtual status_t	SetVideoFrame(BRect rect);
+ 	virtual BRect		VideoFrame() const { return fVideoFrame; };
+ 	virtual status_t	SetScale(float scale);
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h b/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
+new file mode 100644
+index 0000000000..792c4b3804
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef CAM_VIDEO_SIZE_H
++#define CAM_VIDEO_SIZE_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++
++//	The sizes a camera offers are published as the items of a discrete
++//	B_RESOLUTION parameter. An item's value holds the width in the upper and
++//	the height in the lower 16 bits, so that applications can read the list
++//	without guessing.
++
++static const int kCamSizeShift = 16;
++static const uint32_t kCamSizeMask = 0xffff;
++static const uint32_t kCamIntervalsPerSecond = 10000000;
++	// UVC frame intervals count 100 ns.
++
++
++static inline int32_t
++cam_size_to_parameter(uint32_t width, uint32_t height)
++{
++	return (int32_t)(((width & kCamSizeMask) << kCamSizeShift)
++		| (height & kCamSizeMask));
++}
++
++
++//!	Returns false and leaves the sides alone if \a value holds no size.
++static inline bool
++cam_size_from_parameter(int32_t value, uint32_t* width, uint32_t* height)
++{
++	uint32_t w = ((uint32_t)value >> kCamSizeShift) & kCamSizeMask;
++	uint32_t h = (uint32_t)value & kCamSizeMask;
++	if (w == 0 || h == 0)
++		return false;
++
++	*width = w;
++	*height = h;
++	return true;
++}
++
++
++//	Bounds the sides of a picture, so that its size at 4 bytes per pixel stays
++//	far inside 32 bits. The sides come from the camera's descriptors, and no
++//	USB camera comes near this.
++static const uint32_t kCamMaxVideoSide = 8192;
++
++
++static inline bool
++cam_video_size_allowed(uint32_t width, uint32_t height)
++{
++	return width > 0 && height > 0 && width <= kCamMaxVideoSide
++		&& height <= kCamMaxVideoSide;
++}
++
++
++//!	The rounded frames per second of an \a interval, 0 if it is unknown.
++static inline uint32_t
++cam_frames_per_second(uint32_t interval)
++{
++	if (interval == 0)
++		return 0;
++	return (kCamIntervalsPerSecond + interval / 2) / interval;
++}
++
++
++//!	Writes "1920 × 1080 (5 fps)", or without the rate if it is unknown.
++static inline void
++cam_size_label(char* buffer, size_t size, uint32_t width, uint32_t height,
++	uint32_t interval)
++{
++	uint32_t rate = cam_frames_per_second(interval);
++	if (rate == 0) {
++		snprintf(buffer, size, "%u \xc3\x97 %u", (unsigned)width,
++			(unsigned)height);
++		return;
++	}
++	snprintf(buffer, size, "%u \xc3\x97 %u (%u fps)", (unsigned)width,
++		(unsigned)height, (unsigned)rate);
++}
++
++
++#endif	// CAM_VIDEO_SIZE_H
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index ec747d7586..ec261b5b1b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -23,6 +23,7 @@
+ #include <interface/Bitmap.h>
+ 
+ #include "CamDevice.h"
++#include "CamVideoSize.h"
+ #include "CamSensor.h"
+ 
+ // don't separate parameters from addon, device and sensor
+@@ -84,6 +85,10 @@ VideoProducer::VideoProducer(
+ 
+ 	fOutput.destination = media_destination::null;
+ 
++	fPreferredWidth = 0;
++	fPreferredHeight = 0;
++	fLastSizeChange = 0;
++
+ 	AddNodeKind(B_PHYSICAL_INPUT);
+ 
+ 	fInitStatus = B_OK;
+@@ -185,6 +190,8 @@ VideoProducer::NodeRegistered()
+ 	p = g->MakeTextParameter(
+ 		P_INFO, B_MEDIA_RAW_VIDEO, "", "Info", 256);
+ 
++	_AddResolutionParameter(main);
++
+ 	int32 id = P_LAST;
+ 	if (fCamDevice) {
+ #ifndef SINGLE_PARAMETER_GROUP
+@@ -342,7 +349,7 @@ VideoProducer::FormatSuggestionRequested(
+ 
+ 	*format = fOutput.format;
+ 	uint32 width, height;
+-	if (fCamDevice && fCamDevice->SuggestVideoFrame(width, height) == B_OK) {
++	if (_SuggestSize(width, height)) {
+ 		format->u.raw_video.display.line_width = width;
+ 		format->u.raw_video.display.line_count = height;
+ 	}
+@@ -507,7 +514,7 @@ VideoProducer::PrepareToConnect(const media_source &source,
+ 	if (fCamDevice != NULL && (format->u.raw_video.display.line_width == 0
+ 			|| format->u.raw_video.display.line_count == 0)) {
+ 		uint32 width, height;
+-		if (fCamDevice->SuggestVideoFrame(width, height) == B_OK) {
++		if (_SuggestSize(width, height)) {
+ 			format->u.raw_video.display.line_width = width;
+ 			format->u.raw_video.display.line_count = height;
+ 		}
+@@ -570,6 +577,13 @@ VideoProducer::Connect(status_t error, const media_source &source,
+ 		return;
+ 	}
+ 
++	// 4 * width * height below must not overflow.
++	if (!cam_video_size_allowed(format.u.raw_video.display.line_width,
++			format.u.raw_video.display.line_count)) {
++		PRINTF(0, ("Connect: The size is too large\n"));
++		return;
++	}
++
+ 	fOutput.destination = destination;
+ 	strcpy(io_name, fOutput.name);
+ 
+@@ -726,6 +740,8 @@ VideoProducer::GetParameterValue(
+ 			*size = fInfoString.Length() + 1;
+ 			memcpy(value, fInfoString.String(), *size);
+ 			return B_OK;
++		case P_RESOLUTION:
++			return _GetResolution(last_change, value, size);
+ 	}
+ 
+ 	if (fCamDevice) {
+@@ -764,6 +780,11 @@ VideoProducer::SetParameterValue(
+ 		case P_INFO:
+ 			// forbidden
+ 			return;
++		case P_RESOLUTION:
++			if (_SetResolution(value, size) != B_OK)
++				return;
++			fLastSizeChange = when;
++			break;
+ 		default:
+ 			if (fCamDevice == NULL)
+ 				return;
+@@ -780,6 +801,93 @@ VideoProducer::SetParameterValue(
+ }
+ 
+ 
++
++/*!	Publishes the sizes the camera offers as a B_RESOLUTION parameter, so
++	that applications do not have to guess them. See CamVideoSize.h for the
++	values of the items.
++*/
++void
++VideoProducer::_AddResolutionParameter(BParameterGroup* group)
++{
++	if (fCamDevice == NULL || fCamDevice->CountVideoSizes() == 0)
++		return;
++
++	BDiscreteParameter* sizes = group->MakeGroup("Format")
++		->MakeDiscreteParameter(P_RESOLUTION, B_MEDIA_RAW_VIDEO, "Resolution",
++			B_RESOLUTION);
++	for (int32 i = 0; i < fCamDevice->CountVideoSizes(); i++) {
++		uint32 width, height, interval;
++		if (!fCamDevice->VideoSizeAt(i, width, height, interval))
++			continue;
++		char label[48];
++		cam_size_label(label, sizeof(label), width, height, interval);
++		sizes->AddItem(cam_size_to_parameter(width, height), label);
++	}
++}
++
++
++bool
++VideoProducer::_HasVideoSize(uint32 width, uint32 height) const
++{
++	for (int32 i = 0; i < fCamDevice->CountVideoSizes(); i++) {
++		uint32 w, h, interval;
++		if (fCamDevice->VideoSizeAt(i, w, h, interval) && w == width
++			&& h == height) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++//!	The size chosen with the parameter, otherwise the one the device prefers.
++bool
++VideoProducer::_SuggestSize(uint32& width, uint32& height)
++{
++	if (fPreferredWidth != 0) {
++		width = fPreferredWidth;
++		height = fPreferredHeight;
++		return true;
++	}
++	return fCamDevice != NULL
++		&& fCamDevice->SuggestVideoFrame(width, height) == B_OK;
++}
++
++
++status_t
++VideoProducer::_GetResolution(bigtime_t* lastChange, void* value, size_t* size)
++{
++	uint32 width, height;
++	if (*size < sizeof(int32) || !_SuggestSize(width, height))
++		return B_BAD_VALUE;
++
++	*lastChange = fLastSizeChange;
++	*size = sizeof(int32);
++	*(int32*)value = cam_size_to_parameter(width, height);
++	return B_OK;
++}
++
++
++/*!	Takes the size for the next connection that does not ask for one. The
++	running stream is left alone; the value comes from outside and is checked
++	against the camera's list.
++*/
++status_t
++VideoProducer::_SetResolution(const void* value, size_t size)
++{
++	// uint32_t, not uint32: with gcc 2 the two are different pointer types.
++	uint32_t width, height;
++	if (fCamDevice == NULL || value == NULL || size != sizeof(int32)
++		|| !cam_size_from_parameter(*(const int32*)value, &width, &height)
++		|| !_HasVideoSize(width, height)) {
++		return B_BAD_VALUE;
++	}
++
++	fPreferredWidth = width;
++	fPreferredHeight = height;
++	return B_OK;
++}
++
+ status_t
+ VideoProducer::StartControlPanel(BMessenger *out_messenger)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+index 0340feff19..6434cd9552 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+@@ -18,6 +18,9 @@ class CamDevice;
+ class BParameter;
+ class BTextParameter;
+ 
++class BParameterGroup;
++
++
+ class VideoProducer :
+ 	public virtual BMediaEventLooper,
+ 	public virtual BBufferProducer,
+@@ -113,6 +116,12 @@ private:
+ 		void				HandleSeek(bigtime_t performance_time);
+ 
+ 		void				_UpdateStats();
++		void				_AddResolutionParameter(BParameterGroup* group);
++		bool				_HasVideoSize(uint32 width, uint32 height) const;
++		bool				_SuggestSize(uint32& width, uint32& height);
++		status_t			_GetResolution(bigtime_t* lastChange, void* value,
++								size_t* size);
++		status_t			_SetResolution(const void* value, size_t size);
+ 
+ static	int32				fInstances;
+ 
+@@ -145,11 +154,15 @@ static	int32				_frame_generator_(void *data);
+ 		enum {
+ 			 P_COLOR,
+ 			 P_INFO,
++			 P_RESOLUTION,
+ 			 P_LAST			// first available for addons
+ 		};
+ 		uint32				fColor;
+ 		BString				fInfoString;
+ 		bigtime_t			fLastColorChange;	// TODO: rename
++		uint32				fPreferredWidth;
++		uint32				fPreferredHeight;
++		bigtime_t			fLastSizeChange;
+ 
+ 		struct {
+ 			uint32 frames;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 3c841db935..e9a22ed0e2 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -647,6 +647,29 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ }
+ 
+ 
++int32
++UVCCamDevice::CountVideoSizes() const
++{
++	return fUncompressedFrames.CountItems();
++}
++
++
++bool
++UVCCamDevice::VideoSizeAt(int32 index, uint32& width, uint32& height,
++	uint32& interval) const
++{
++	const usb_video_frame_descriptor* descriptor
++		= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(index);
++	if (descriptor == NULL)
++		return false;
++
++	width = descriptor->width;
++	height = descriptor->height;
++	interval = descriptor->default_frame_interval;
++	return true;
++}
++
++
+ void
+ UVCCamDevice::DataLost()
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index dfc0e1e987..8737a9e834 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -26,6 +26,9 @@ public:
+ 									uint32 &height);
+ 	virtual status_t			AcceptVideoFrame(uint32 &width,
+ 									uint32 &height);
++	virtual int32				CountVideoSizes() const;
++	virtual bool				VideoSizeAt(int32 index, uint32 &width,
++									uint32 &height, uint32 &interval) const;
+ 	virtual void				AddParameters(BParameterGroup *group,
+ 									int32 &index);
+ 	virtual status_t			GetParameterValue(int32 id,
+diff --git a/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp b/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
+new file mode 100644
+index 0000000000..117eb3d9ba
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "CamVideoSize.h"
++
++#include <stdio.h>
++#include <string.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_size_survives_the_parameter_value()
++{
++	int32_t value = cam_size_to_parameter(1920, 1080);
++	uint32_t width = 0;
++	uint32_t height = 0;
++	CHECK(cam_size_from_parameter(value, &width, &height));
++	CHECK(width == 1920 && height == 1080);
++}
++
++
++static void
++test_value_is_width_above_height()
++{
++	// Applications read the value without this header: width in the upper
++	// 16 bits, height in the lower ones.
++	CHECK(cam_size_to_parameter(640, 480) == (640 << 16 | 480));
++}
++
++
++static void
++test_value_without_a_side_is_no_size()
++{
++	uint32_t width = 7;
++	uint32_t height = 7;
++	CHECK(!cam_size_from_parameter(0, &width, &height));
++	CHECK(!cam_size_from_parameter(640 << 16, &width, &height));
++	CHECK(!cam_size_from_parameter(480, &width, &height));
++	CHECK(width == 7 && height == 7);
++}
++
++
++static void
++test_frame_rate_from_the_interval()
++{
++	// Intervals count 100 ns.
++	CHECK(cam_frames_per_second(333333) == 30);
++	CHECK(cam_frames_per_second(666666) == 15);
++	CHECK(cam_frames_per_second(2000000) == 5);
++	CHECK(cam_frames_per_second(0) == 0);
++}
++
++
++static void
++test_label_with_and_without_rate()
++{
++	char label[48];
++	cam_size_label(label, sizeof(label), 1920, 1080, 2000000);
++	CHECK(strcmp(label, "1920 \xc3\x97 1080 (5 fps)") == 0);
++
++	cam_size_label(label, sizeof(label), 640, 480, 0);
++	CHECK(strcmp(label, "640 \xc3\x97 480") == 0);
++}
++
++
++static void
++test_only_sizes_up_to_the_limit_are_allowed()
++{
++	CHECK(cam_video_size_allowed(640, 480));
++	CHECK(cam_video_size_allowed(kCamMaxVideoSide, kCamMaxVideoSide));
++	CHECK(!cam_video_size_allowed(0, 480));
++	CHECK(!cam_video_size_allowed(640, 0));
++	CHECK(!cam_video_size_allowed(kCamMaxVideoSide + 1, 1));
++	CHECK(!cam_video_size_allowed(32768, 32768));
++}
++
++
++#define RUN(test) \
++	do { \
++		int before = sFailures; \
++		test(); \
++		sTests++; \
++		printf("%s %s\n", sFailures == before ? "ok  " : "FAIL", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_size_survives_the_parameter_value);
++	RUN(test_value_is_width_above_height);
++	RUN(test_value_without_a_side_is_no_size);
++	RUN(test_frame_rate_from_the_interval);
++	RUN(test_label_with_and_without_rate);
++	RUN(test_only_sizes_up_to_the_limit_are_allowed);
++
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index 81cf331730..32b8f3d75e 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -4,6 +4,7 @@ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
+ 
+ SimpleTest CamDeviceNameTest : CamDeviceNameTest.cpp ;
++SimpleTest CamVideoSizeTest : CamVideoSizeTest.cpp ;
+ SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
+ SimpleTest UVCColorTest : UVCColorTest.cpp ;
+ SimpleTest UVCFrameBufferTest : UVCFrameBufferTest.cpp ;
+-- 
+2.54.1
+

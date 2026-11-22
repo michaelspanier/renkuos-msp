@@ -1,0 +1,32 @@
+From 8f1f6c8a1943e2acc845e31505ce360eaa198060 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 12:06:34 +0000
+Subject: [PATCH 26/34] boot/efi: give the loader a 16 MB heap
+
+With 1.5 MB the loader ran out of memory while mounting the system package of a second installation (packagefs.cpp: Out of memory), so the boot menu listed only the volume it had booted from.
+
+msp: found on the T470s with RenkuOS-A and RenkuOS-B, not in any PR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/boot/platform/efi/start.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/system/boot/platform/efi/start.cpp b/src/system/boot/platform/efi/start.cpp
+index 1a0028d852..8ee61c3089 100644
+--- a/src/system/boot/platform/efi/start.cpp
++++ b/src/system/boot/platform/efi/start.cpp
+@@ -243,6 +243,10 @@ efi_main(efi_handle image, efi_system_table *systemTable)
+ {
+ 	stage2_args args;
+ 	memset(&args, 0, sizeof(stage2_args));
++	// The default heap of 1.5 MB holds the packagefs tree of one system
++	// package only, so the boot menu could not list a second installation.
++	// EFI has memory to spare.
++	args.heap_size = 16 * 1024 * 1024;
+ 
+ 	kImage = image;
+ 	kSystemTable = systemTable;
+-- 
+2.54.1
+

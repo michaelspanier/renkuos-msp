@@ -1,0 +1,877 @@
+From 51b9f319276f8922c1e529010a64f2184fb5c0a1 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:27:42 +0000
+Subject: [PATCH 12/43] usb_webcam: add an MJPEG decoder and a frame list for
+ UVC
+
+Two building blocks for MJPEG, which the next change puts to use:
+
+UVCFrameList.h builds one list of sizes from the frame descriptors of
+all formats: for each size the faster format, the uncompressed one at
+the same rate, sorted by area and capped at 32 entries. Each entry
+keeps its own format and frame index for the probe.
+
+UVCJpegDecoder decodes a frame with libjpeg-turbo straight into
+B_RGB32. Errors are caught, and a damaged frame, which libjpeg only
+reports as a warning, is dropped. The size and the output buffer are
+checked once before decoding. Frames without Huffman tables, as the
+built-in camera of a ThinkPad T470s sends them, get the standard
+tables from libjpeg.
+
+UVCFrameListTest and UVCJpegDecoderTest cover both; the decoder test
+encodes its own small frames, also one without Huffman tables.
+Decoding a 1920x1080 frame of a Logitech C920 takes 8 ms on an
+i7-7500U.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 885226f1c6d6426bf58f1a29da97169ed38b8118)
+---
+ .../usb_webcam/addons/uvc/UVCFrameList.h      | 111 +++++++
+ .../usb_webcam/addons/uvc/UVCJpegDecoder.cpp  | 130 +++++++++
+ .../usb_webcam/addons/uvc/UVCJpegDecoder.h    |  44 +++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   9 +
+ .../media/usb_webcam/UVCFrameListTest.cpp     | 228 +++++++++++++++
+ .../media/usb_webcam/UVCJpegDecoderTest.cpp   | 271 ++++++++++++++++++
+ 6 files changed, 793 insertions(+)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFrameList.h
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.cpp
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCFrameListTest.cpp
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCJpegDecoderTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFrameList.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFrameList.h
+new file mode 100644
+index 0000000000..51ed4031c7
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFrameList.h
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef UVC_FRAME_LIST_H
++#define UVC_FRAME_LIST_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++static const int32_t kUvcMaxFrames = 32;
++
++
++struct uvc_frame {
++			uint16_t			width;
++			uint16_t			height;
++			uint8_t				formatIndex;
++			uint8_t				frameIndex;
++			uint32_t			interval;
++				// 100 ns units, 0 if unknown
++			bool				compressed;
++};
++
++
++struct uvc_frame_list {
++			uvc_frame			frames[kUvcMaxFrames];
++			int32_t				count;
++};
++
++
++static inline void
++uvc_frame_list_init(uvc_frame_list* list)
++{
++	list->count = 0;
++}
++
++
++static inline const uvc_frame*
++uvc_frame_list_find(const uvc_frame_list* list, uint32_t width,
++	uint32_t height)
++{
++	for (int32_t i = 0; i < list->count; i++) {
++		const uvc_frame& frame = list->frames[i];
++		if (frame.width == width && frame.height == height)
++			return &frame;
++	}
++	return NULL;
++}
++
++
++/*!	Tells whether \a candidate should replace \a current of the same size:
++	more frames per second win, at equal speed the uncompressed frame wins as
++	it needs no decoding.
++*/
++static inline bool
++uvc_frame_is_better(const uvc_frame& candidate, const uvc_frame& current)
++{
++	if (candidate.interval == current.interval)
++		return !candidate.compressed && current.compressed;
++	if (candidate.interval == 0)
++		return false;
++	return current.interval == 0 || candidate.interval < current.interval;
++}
++
++
++static inline bool
++uvc_frame_is_smaller(const uvc_frame& frame, const uvc_frame& other)
++{
++	uint32_t area = (uint32_t)frame.width * frame.height;
++	uint32_t otherArea = (uint32_t)other.width * other.height;
++	if (area != otherArea)
++		return area < otherArea;
++	return frame.width < other.width;
++}
++
++
++/*!	Adds a frame of one of the camera's formats. A size offered by several
++	formats is listed once, with the better format. The list stays sorted
++	from the smallest to the largest picture.
++*/
++static inline void
++uvc_frame_list_add(uvc_frame_list* list, const uvc_frame& frame)
++{
++	if (frame.width == 0 || frame.height == 0)
++		return;
++
++	uvc_frame* known = (uvc_frame*)uvc_frame_list_find(list, frame.width,
++		frame.height);
++	if (known != NULL) {
++		if (uvc_frame_is_better(frame, *known))
++			*known = frame;
++		return;
++	}
++	if (list->count == kUvcMaxFrames)
++		return;
++
++	int32_t index = list->count;
++	while (index > 0 && uvc_frame_is_smaller(frame, list->frames[index - 1])) {
++		list->frames[index] = list->frames[index - 1];
++		index--;
++	}
++	list->frames[index] = frame;
++	list->count++;
++}
++
++
++#endif	// UVC_FRAME_LIST_H
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.cpp
+new file mode 100644
+index 0000000000..2b37df87c2
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.cpp
+@@ -0,0 +1,130 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCJpegDecoder.h"
++
++#include <new>
++#include <setjmp.h>
++#include <stdio.h>
++
++#include <jpeglib.h>
++
++#ifndef JCS_EXTENSIONS
++#	error "libjpeg-turbo is needed for decoding to B_RGB32"
++#endif
++
++
++static const int32_t kBytesPerPixel = 4;
++
++
++//	libjpeg ends the process on errors unless the handler jumps back.
++struct uvc_jpeg_errors {
++	jpeg_error_mgr	manager;
++	jmp_buf			jump;
++};
++
++
++struct UVCJpegDecoder::State {
++	jpeg_decompress_struct	info;
++	uvc_jpeg_errors			errors;
++};
++
++
++static void
++uvc_jpeg_fail(j_common_ptr info)
++{
++	longjmp(((uvc_jpeg_errors*)info->err)->jump, 1);
++}
++
++
++static void
++uvc_jpeg_stay_quiet(j_common_ptr)
++{
++}
++
++
++UVCJpegDecoder::UVCJpegDecoder()
++	:
++	fState(new(std::nothrow) State())
++{
++	if (fState == NULL)
++		return;
++
++	fState->info.err = jpeg_std_error(&fState->errors.manager);
++	fState->errors.manager.error_exit = uvc_jpeg_fail;
++	fState->errors.manager.output_message = uvc_jpeg_stay_quiet;
++	if (setjmp(fState->errors.jump) != 0) {
++		// State() starts zeroed, so this is safe at every point.
++		jpeg_destroy_decompress(&fState->info);
++		delete fState;
++		fState = NULL;
++		return;
++	}
++	jpeg_create_decompress(&fState->info);
++}
++
++
++UVCJpegDecoder::~UVCJpegDecoder()
++{
++	if (fState == NULL)
++		return;
++
++	jpeg_destroy_decompress(&fState->info);
++	delete fState;
++}
++
++
++bool
++UVCJpegDecoder::InitCheck() const
++{
++	return fState != NULL;
++}
++
++
++/*!	Decodes \a jpeg into \a picture, which must have the size of the JPEG
++	picture. Returns false for anything but a complete, undamaged picture;
++	\a picture may then be partly written.
++*/
++bool
++UVCJpegDecoder::Decode(const uint8_t* jpeg, size_t length,
++	const uvc_picture& picture)
++{
++	if (fState == NULL || jpeg == NULL || length == 0 || picture.width <= 0
++		|| picture.height <= 0
++		|| picture.size / kBytesPerPixel / picture.width
++			< (size_t)picture.height) {
++		return false;
++	}
++
++	jpeg_decompress_struct& info = fState->info;
++	if (setjmp(fState->errors.jump) != 0) {
++		jpeg_abort_decompress(&info);
++		return false;
++	}
++
++	jpeg_mem_src(&info, (unsigned char*)jpeg, length);
++	jpeg_read_header(&info, TRUE);
++	if (info.image_width != (JDIMENSION)picture.width
++		|| info.image_height != (JDIMENSION)picture.height) {
++		jpeg_abort_decompress(&info);
++		return false;
++	}
++
++	info.out_color_space = JCS_EXT_BGRX;
++	jpeg_start_decompress(&info);
++	const size_t bytesPerRow = (size_t)picture.width * kBytesPerPixel;
++	while (info.output_scanline < info.output_height) {
++		JSAMPROW row = picture.bits + info.output_scanline * bytesPerRow;
++		jpeg_read_scanlines(&info, &row, 1);
++	}
++
++	// libjpeg fills in what is missing of a damaged picture and only warns.
++	const bool complete = info.err->num_warnings == 0;
++	jpeg_finish_decompress(&info);
++	return complete;
++}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.h
+new file mode 100644
+index 0000000000..0843d28021
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCJpegDecoder.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef UVC_JPEG_DECODER_H
++#define UVC_JPEG_DECODER_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++struct uvc_picture {
++			uint8_t*			bits;
++			size_t				size;
++			int32_t				width;
++			int32_t				height;
++};
++
++
++/*!	Decodes the JPEG pictures of an MJPEG stream into B_RGB32. Keeps one
++	decompressor for the whole stream.
++*/
++class UVCJpegDecoder {
++public:
++								UVCJpegDecoder();
++								~UVCJpegDecoder();
++
++			bool				InitCheck() const;
++			bool				Decode(const uint8_t* jpeg, size_t length,
++									const uvc_picture& picture);
++
++private:
++								UVCJpegDecoder(const UVCJpegDecoder&);
++			UVCJpegDecoder&		operator=(const UVCJpegDecoder&);
++
++			struct				State;
++			State*				fState;
++};
++
++
++#endif	// UVC_JPEG_DECODER_H
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index 2470be25b5..de2b605ed9 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -9,4 +9,13 @@ SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
+ SimpleTest UVCColorTest : UVCColorTest.cpp ;
+ SimpleTest UVCControlsTest : UVCControlsTest.cpp ;
+ SimpleTest UVCFrameBufferTest : UVCFrameBufferTest.cpp ;
++SimpleTest UVCFrameListTest : UVCFrameListTest.cpp ;
+ SimpleTest UVCPayloadTest : UVCPayloadTest.cpp ;
++
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media media-add-ons
++	usb_webcam addons uvc ] ;
++UseBuildFeatureHeaders jpeg ;
++SimpleTest UVCJpegDecoderTest : UVCJpegDecoderTest.cpp UVCJpegDecoder.cpp
++	: [ BuildFeatureAttribute jpeg : library ] [ TargetLibstdc++ ] ;
++Includes [ FGristFiles UVCJpegDecoderTest.cpp UVCJpegDecoder.cpp ]
++	: [ BuildFeatureAttribute jpeg : headers ] ;
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCFrameListTest.cpp b/src/tests/add-ons/media/usb_webcam/UVCFrameListTest.cpp
+new file mode 100644
+index 0000000000..3abc4363df
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCFrameListTest.cpp
+@@ -0,0 +1,228 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCFrameList.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static const uint32_t k30fps = 333333;
++static const uint32_t k10fps = 1000000;
++static const uint32_t k5fps = 2000000;
++
++
++static uvc_frame
++make_frame(uint16_t width, uint16_t height, uint32_t interval, bool compressed)
++{
++	uvc_frame frame;
++	frame.width = width;
++	frame.height = height;
++	frame.formatIndex = compressed ? 2 : 1;
++	frame.frameIndex = 7;
++	frame.interval = interval;
++	frame.compressed = compressed;
++	return frame;
++}
++
++
++static void
++test_empty_list_finds_nothing()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	CHECK(list.count == 0);
++	CHECK(uvc_frame_list_find(&list, 640, 480) == NULL);
++}
++
++
++static void
++test_found_frame_keeps_its_indices()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame frame = make_frame(640, 480, k30fps, false);
++	frame.formatIndex = 3;
++	frame.frameIndex = 9;
++	uvc_frame_list_add(&list, frame);
++
++	const uvc_frame* found = uvc_frame_list_find(&list, 640, 480);
++	CHECK(found != NULL);
++	CHECK(found != NULL && found->formatIndex == 3 && found->frameIndex == 9);
++	CHECK(uvc_frame_list_find(&list, 480, 640) == NULL);
++}
++
++
++static void
++test_faster_compressed_frame_replaces_slow_uncompressed()
++{
++	// The C920 sends 1920 x 1080 uncompressed at 5 and as MJPEG at 30 frames
++	// per second.
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(1920, 1080, k5fps, false));
++	uvc_frame_list_add(&list, make_frame(1920, 1080, k30fps, true));
++
++	CHECK(list.count == 1);
++	const uvc_frame* found = uvc_frame_list_find(&list, 1920, 1080);
++	CHECK(found != NULL && found->compressed && found->interval == k30fps);
++}
++
++
++static void
++test_slower_compressed_frame_does_not_replace()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(640, 480, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(640, 480, k10fps, true));
++
++	const uvc_frame* found = uvc_frame_list_find(&list, 640, 480);
++	CHECK(found != NULL && !found->compressed);
++}
++
++
++static void
++test_uncompressed_wins_at_equal_speed()
++{
++	// No decoding and no compression artefacts, whichever comes first.
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(640, 480, k30fps, true));
++	uvc_frame_list_add(&list, make_frame(640, 480, k30fps, false));
++
++	const uvc_frame* found = uvc_frame_list_find(&list, 640, 480);
++	CHECK(found != NULL && !found->compressed);
++
++	uvc_frame_list_add(&list, make_frame(640, 480, k30fps, true));
++	found = uvc_frame_list_find(&list, 640, 480);
++	CHECK(found != NULL && !found->compressed);
++	CHECK(list.count == 1);
++}
++
++
++static void
++test_unknown_interval_counts_as_slowest()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(640, 480, 0, false));
++	uvc_frame_list_add(&list, make_frame(640, 480, k5fps, true));
++	const uvc_frame* found = uvc_frame_list_find(&list, 640, 480);
++	CHECK(found != NULL && found->compressed);
++
++	uvc_frame_list_add(&list, make_frame(320, 240, k5fps, false));
++	uvc_frame_list_add(&list, make_frame(320, 240, 0, true));
++	found = uvc_frame_list_find(&list, 320, 240);
++	CHECK(found != NULL && !found->compressed);
++}
++
++
++static void
++test_list_is_sorted_by_area()
++{
++	// Cameras list their sizes in any order, the menu shows them growing.
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(640, 480, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(1280, 720, k30fps, true));
++	uvc_frame_list_add(&list, make_frame(320, 180, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(424, 240, k30fps, false));
++
++	CHECK(list.count == 4);
++	CHECK(list.frames[0].width == 320);
++	CHECK(list.frames[1].width == 424);
++	CHECK(list.frames[2].width == 640);
++	CHECK(list.frames[3].width == 1280);
++}
++
++
++static void
++test_equal_area_keeps_wider_last()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(640, 360, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(480, 480, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(360, 640, k30fps, false));
++
++	CHECK(list.count == 3);
++	CHECK(list.frames[0].width == 360);
++	CHECK(list.frames[1].width == 480);
++	CHECK(list.frames[2].width == 640);
++}
++
++
++static void
++test_full_list_drops_further_sizes()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	for (int32_t i = 0; i < kUvcMaxFrames + 5; i++)
++		uvc_frame_list_add(&list, make_frame(16 + i, 16, k30fps, false));
++
++	CHECK(list.count == kUvcMaxFrames);
++	CHECK(uvc_frame_list_find(&list, 16 + kUvcMaxFrames - 1, 16) != NULL);
++	CHECK(uvc_frame_list_find(&list, 16 + kUvcMaxFrames, 16) == NULL);
++
++	// A known size can still change its format.
++	uvc_frame_list_add(&list, make_frame(16, 16, k30fps / 2, true));
++	const uvc_frame* found = uvc_frame_list_find(&list, 16, 16);
++	CHECK(found != NULL && found->compressed);
++}
++
++
++static void
++test_zero_side_is_ignored()
++{
++	uvc_frame_list list;
++	uvc_frame_list_init(&list);
++	uvc_frame_list_add(&list, make_frame(0, 480, k30fps, false));
++	uvc_frame_list_add(&list, make_frame(640, 0, k30fps, false));
++	CHECK(list.count == 0);
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_empty_list_finds_nothing);
++	RUN(test_found_frame_keeps_its_indices);
++	RUN(test_faster_compressed_frame_replaces_slow_uncompressed);
++	RUN(test_slower_compressed_frame_does_not_replace);
++	RUN(test_uncompressed_wins_at_equal_speed);
++	RUN(test_unknown_interval_counts_as_slowest);
++	RUN(test_list_is_sorted_by_area);
++	RUN(test_equal_area_keeps_wider_last);
++	RUN(test_full_list_drops_further_sizes);
++	RUN(test_zero_side_is_ignored);
++
++	printf("\n%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCJpegDecoderTest.cpp b/src/tests/add-ons/media/usb_webcam/UVCJpegDecoderTest.cpp
+new file mode 100644
+index 0000000000..fa239cd797
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCJpegDecoderTest.cpp
+@@ -0,0 +1,271 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCJpegDecoder.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <vector>
++
++#include <jpeglib.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static const int32_t kWidth = 32;
++static const int32_t kHeight = 16;
++static const uint8_t kUntouched = 0x5a;
++
++
++//!	A picture whose left half is red and right half blue, as 4:2:2 JPEG.
++static std::vector<uint8_t>
++make_jpeg(int32_t width, int32_t height)
++{
++	jpeg_compress_struct info;
++	jpeg_error_mgr errors;
++	info.err = jpeg_std_error(&errors);
++	jpeg_create_compress(&info);
++
++	unsigned char* data = NULL;
++	unsigned long size = 0;
++	jpeg_mem_dest(&info, &data, &size);
++	info.image_width = width;
++	info.image_height = height;
++	info.input_components = 3;
++	info.in_color_space = JCS_RGB;
++	jpeg_set_defaults(&info);
++	jpeg_set_quality(&info, 95, TRUE);
++	info.comp_info[0].h_samp_factor = 2;
++	info.comp_info[0].v_samp_factor = 1;
++	jpeg_start_compress(&info, TRUE);
++
++	std::vector<uint8_t> row(width * 3);
++	for (int32_t x = 0; x < width; x++) {
++		bool left = x < width / 2;
++		row[x * 3] = left ? 255 : 0;
++		row[x * 3 + 1] = 0;
++		row[x * 3 + 2] = left ? 0 : 255;
++	}
++	while (info.next_scanline < info.image_height) {
++		JSAMPROW pointer = &row[0];
++		jpeg_write_scanlines(&info, &pointer, 1);
++	}
++	jpeg_finish_compress(&info);
++	jpeg_destroy_compress(&info);
++
++	std::vector<uint8_t> jpeg(data, data + size);
++	free(data);
++	return jpeg;
++}
++
++
++//!	Removes the Huffman tables, as most cameras do in their MJPEG frames.
++static std::vector<uint8_t>
++strip_huffman_tables(const std::vector<uint8_t>& jpeg)
++{
++	std::vector<uint8_t> stripped(jpeg.begin(), jpeg.begin() + 2);
++	size_t i = 2;
++	while (i + 4 <= jpeg.size() && jpeg[i] == 0xff && jpeg[i + 1] != 0xda) {
++		size_t length = 2 + (jpeg[i + 2] << 8 | jpeg[i + 3]);
++		if (jpeg[i + 1] != 0xc4) {
++			stripped.insert(stripped.end(), jpeg.begin() + i,
++				jpeg.begin() + i + length);
++		}
++		i += length;
++	}
++	stripped.insert(stripped.end(), jpeg.begin() + i, jpeg.end());
++	return stripped;
++}
++
++
++static bool
++has_huffman_tables(const std::vector<uint8_t>& jpeg)
++{
++	for (size_t i = 0; i + 1 < jpeg.size(); i++) {
++		if (jpeg[i] == 0xff && jpeg[i + 1] == 0xc4)
++			return true;
++	}
++	return false;
++}
++
++
++struct test_picture {
++	std::vector<uint8_t>	bits;
++	uvc_picture				picture;
++
++	test_picture(int32_t width, int32_t height, size_t size)
++		:
++		bits(size, kUntouched)
++	{
++		picture.bits = &bits[0];
++		picture.size = size;
++		picture.width = width;
++		picture.height = height;
++	}
++
++	bool Untouched() const
++	{
++		for (size_t i = 0; i < bits.size(); i++) {
++			if (bits[i] != kUntouched)
++				return false;
++		}
++		return true;
++	}
++};
++
++
++static bool
++near(uint8_t value, uint8_t expected)
++{
++	return abs((int)value - (int)expected) <= 16;
++}
++
++
++//!	B_RGB32 is blue, green, red, alpha in memory.
++static bool
++is_red_then_blue(const test_picture& test)
++{
++	const uint8_t* left = &test.bits[(kHeight / 2 * kWidth + 4) * 4];
++	const uint8_t* right = &test.bits[(kHeight / 2 * kWidth + kWidth - 4) * 4];
++	return near(left[0], 0) && near(left[1], 0) && near(left[2], 255)
++		&& left[3] == 255 && near(right[0], 255) && near(right[1], 0)
++		&& near(right[2], 0) && right[3] == 255;
++}
++
++
++static void
++test_decodes_to_rgb32()
++{
++	UVCJpegDecoder decoder;
++	CHECK(decoder.InitCheck());
++	std::vector<uint8_t> jpeg = make_jpeg(kWidth, kHeight);
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4);
++
++	CHECK(decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++	CHECK(is_red_then_blue(test));
++}
++
++
++static void
++test_decodes_frame_without_huffman_tables()
++{
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> jpeg = strip_huffman_tables(make_jpeg(kWidth, kHeight));
++	CHECK(!has_huffman_tables(jpeg));
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4);
++
++	CHECK(decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++	CHECK(is_red_then_blue(test));
++}
++
++
++static void
++test_rejects_other_size()
++{
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> jpeg = make_jpeg(kWidth * 2, kHeight);
++	test_picture test(kWidth, kHeight, kWidth * 2 * kHeight * 4);
++
++	CHECK(!decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++	CHECK(test.Untouched());
++}
++
++
++static void
++test_rejects_small_output()
++{
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> jpeg = make_jpeg(kWidth, kHeight);
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4 - 1);
++
++	CHECK(!decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++	CHECK(test.Untouched());
++}
++
++
++static void
++test_rejects_truncated_frame()
++{
++	// A frame that lost packets on the way.
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> jpeg = make_jpeg(kWidth, kHeight);
++	jpeg.resize(jpeg.size() * 2 / 3);
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4);
++
++	CHECK(!decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++}
++
++
++static void
++test_rejects_data_that_is_no_jpeg()
++{
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> noise(4096);
++	for (size_t i = 0; i < noise.size(); i++)
++		noise[i] = (uint8_t)(i * 37 + 11);
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4);
++
++	CHECK(!decoder.Decode(&noise[0], noise.size(), test.picture));
++	CHECK(!decoder.Decode(&noise[0], 0, test.picture));
++	CHECK(!decoder.Decode(NULL, 0, test.picture));
++	CHECK(test.Untouched());
++}
++
++
++static void
++test_decodes_again_after_a_failure()
++{
++	UVCJpegDecoder decoder;
++	std::vector<uint8_t> jpeg = make_jpeg(kWidth, kHeight);
++	std::vector<uint8_t> truncated(jpeg.begin(), jpeg.begin() + jpeg.size() / 2);
++	test_picture test(kWidth, kHeight, kWidth * kHeight * 4);
++
++	CHECK(!decoder.Decode(&truncated[0], truncated.size(), test.picture));
++	CHECK(decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++	CHECK(is_red_then_blue(test));
++	CHECK(!decoder.Decode(&truncated[0], truncated.size(), test.picture));
++	CHECK(decoder.Decode(&jpeg[0], jpeg.size(), test.picture));
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_decodes_to_rgb32);
++	RUN(test_decodes_frame_without_huffman_tables);
++	RUN(test_rejects_other_size);
++	RUN(test_rejects_small_output);
++	RUN(test_rejects_truncated_frame);
++	RUN(test_rejects_data_that_is_no_jpeg);
++	RUN(test_decodes_again_after_a_failure);
++
++	printf("\n%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

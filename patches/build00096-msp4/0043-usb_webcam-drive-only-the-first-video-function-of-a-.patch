@@ -1,0 +1,294 @@
+From a06dd663820fa0da2bf3499fa4bcce90838a3e34 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 22:12:11 +0000
+Subject: [PATCH 43/43] usb_webcam: drive only the first video function of a
+ camera
+
+Some cameras have more than one UVC video function in one configuration,
+like the 0c45:6d1f of the Dell XPS 15 9520 from #348: interfaces 0 and 1
+are the color camera, interfaces 2 and 3 an infrared one. Only the first
+streaming interface was taken, but every video control interface was
+parsed. The one of the infrared function overwrote fControlIndex, its
+units were added to those of the color function and the interrupt
+endpoint could come from it. The picture came from the color camera, but
+brightness and the other controls went to the infrared one.
+
+Take only the first video control interface. Its class specific header
+lists the streaming interfaces of its function in baInterfaceNr[], and
+the first streaming interface from that list is taken. The control
+interface comes before its streaming interfaces, so the header is parsed
+by then. Without a header or with an empty list, the first streaming
+interface is taken as before.
+
+The check is uvc_function_has_streaming() in UVCFunction.h, with tests
+in UVCFunctionTest. Tested: the add-on and the test build for x86_64
+without warnings, the test passes on the build host with ASan and UBSan.
+Not tested on a camera with two video functions.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    |  19 ++-
+ .../usb_webcam/addons/uvc/UVCFunction.h       |  47 +++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   1 +
+ .../media/usb_webcam/UVCFunctionTest.cpp      | 130 ++++++++++++++++++
+ 4 files changed, 194 insertions(+), 3 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFunction.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCFunctionTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 2c8c1d15b4..3211fc40e5 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -10,6 +10,7 @@
+ #include "UVCColor.h"
+ #include "UVCControls.h"
+ #include "UVCDeframer.h"
++#include "UVCFunction.h"
+ 
+ #include <Autolock.h>
+ #include <stdio.h>
+@@ -111,6 +112,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 
+ 	generic = (usb_descriptor*)buffer;
+ 
++	bool controlFound = false;
+ 	bool streamingFound = false;
+ 	for (uint32 i = 0; i < _device->CountConfigurations(); i++) {
+ 		config = _device->ConfigurationAt(i);
+@@ -127,6 +129,12 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 				printf("UVCCamDevice: (%" B_PRIu32 ",%" B_PRIu32 "): Found Video Control "
+ 					"interface.\n", i, j);
+ 
++				// A camera may have more than one video function, as a color
++				// and an infrared one. Only the first one is driven.
++				if (controlFound)
++					continue;
++				controlFound = true;
++
+ 				// look for class specific interface descriptors and parse them
+ 				for (uint32 k = 0; interface->OtherDescriptorAt(k, generic,
+ 					sizeof(buffer)) == B_OK; k++) {
+@@ -151,10 +159,15 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 					"interface.\n", i, j);
+ 
+ 				// Format and frame indices only hold within their interface,
+-				// and the stream is set up on one. A second one, as of an
+-				// infrared camera, is left alone.
+-				if (streamingFound)
++				// and the stream is set up on one. Take the first one that the
++				// header of the control interface, which comes before it,
++				// lists. A second one, as of an infrared camera, is left alone.
++				if (streamingFound || !uvc_function_has_streaming(
++						(const uint8*)fHeaderDescriptor,
++						fHeaderDescriptor != NULL ? fHeaderDescriptor->length : 0,
++						interface->Descriptor()->interface_number)) {
+ 					continue;
++				}
+ 				streamingFound = true;
+ 
+ 				// An earlier run may have left an alternate setting active,
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFunction.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFunction.h
+new file mode 100644
+index 0000000000..3171caa58a
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCFunction.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef UVC_FUNCTION_H
++#define UVC_FUNCTION_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++//	The class specific VC interface header up to bInCollection, which is
++//	followed by baInterfaceNr[]. (UVC 1.0 § 3.7.2.)
++static const size_t kUVCControlHeaderLength = 12;
++static const size_t kUVCInCollectionOffset = 11;
++
++
++/*!	Whether the streaming interface \a number belongs to the video function
++	whose control interface has the class specific \a header of \a length
++	bytes. Without a header, or with an empty collection, every streaming
++	interface is taken to belong to it.
++*/
++static inline bool
++uvc_function_has_streaming(const uint8_t* header, size_t length,
++	uint8_t number)
++{
++	if (header == NULL || length < kUVCControlHeaderLength)
++		return true;
++
++	size_t count = header[kUVCInCollectionOffset];
++	if (count > length - kUVCControlHeaderLength)
++		count = length - kUVCControlHeaderLength;
++	if (count == 0)
++		return true;
++
++	for (size_t i = 0; i < count; i++) {
++		if (header[kUVCControlHeaderLength + i] == number)
++			return true;
++	}
++	return false;
++}
++
++
++#endif	// UVC_FUNCTION_H
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index 26ffc0a5e6..0d66df2cf4 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -12,6 +12,7 @@ SimpleTest UVCColorTest : UVCColorTest.cpp ;
+ SimpleTest UVCControlsTest : UVCControlsTest.cpp ;
+ SimpleTest UVCFrameBufferTest : UVCFrameBufferTest.cpp ;
+ SimpleTest UVCFrameListTest : UVCFrameListTest.cpp ;
++SimpleTest UVCFunctionTest : UVCFunctionTest.cpp ;
+ SimpleTest UVCPayloadTest : UVCPayloadTest.cpp ;
+ 
+ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media media-add-ons
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCFunctionTest.cpp b/src/tests/add-ons/media/usb_webcam/UVCFunctionTest.cpp
+new file mode 100644
+index 0000000000..ec8c5b1661
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCFunctionTest.cpp
+@@ -0,0 +1,130 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCFunction.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++// A VC header like that of the color function of the Dell XPS 15 9520 camera
++// (0c45:6d1f): UVC 1.0, one streaming interface, number 1.
++static const uint8_t kColorHeader[] = {
++	0x0d, 0x24, 0x01, 0x00, 0x01, 0x4e, 0x00, 0x80, 0xc3, 0xc9, 0x01, 0x01,
++	0x01
++};
++
++// The infrared function of the same camera lists streaming interface 3.
++static const uint8_t kInfraredHeader[] = {
++	0x0d, 0x24, 0x01, 0x00, 0x01, 0x4e, 0x00, 0x80, 0xc3, 0xc9, 0x01, 0x01,
++	0x03
++};
++
++
++static void
++test_listed_streaming_interface_belongs()
++{
++	CHECK(uvc_function_has_streaming(kColorHeader, sizeof(kColorHeader), 1));
++	CHECK(uvc_function_has_streaming(kInfraredHeader, sizeof(kInfraredHeader),
++		3));
++}
++
++
++static void
++test_streaming_interface_of_other_function_is_left_alone()
++{
++	// The controls of the color camera must not drive the infrared stream.
++	CHECK(!uvc_function_has_streaming(kColorHeader, sizeof(kColorHeader), 3));
++	CHECK(!uvc_function_has_streaming(kInfraredHeader, sizeof(kInfraredHeader),
++		1));
++}
++
++
++static void
++test_any_of_several_listed_interfaces_belongs()
++{
++	const uint8_t header[] = {
++		0x0e, 0x24, 0x01, 0x10, 0x01, 0x4e, 0x00, 0x80, 0xc3, 0xc9, 0x01, 0x02,
++		0x01, 0x02
++	};
++	CHECK(uvc_function_has_streaming(header, sizeof(header), 1));
++	CHECK(uvc_function_has_streaming(header, sizeof(header), 2));
++	CHECK(!uvc_function_has_streaming(header, sizeof(header), 3));
++}
++
++
++static void
++test_without_header_every_interface_belongs()
++{
++	CHECK(uvc_function_has_streaming(NULL, 0, 1));
++	CHECK(uvc_function_has_streaming(kColorHeader, 0, 3));
++	CHECK(uvc_function_has_streaming(kColorHeader, kUVCControlHeaderLength - 1,
++		3));
++}
++
++
++static void
++test_empty_collection_takes_every_interface()
++{
++	const uint8_t header[] = {
++		0x0c, 0x24, 0x01, 0x00, 0x01, 0x4e, 0x00, 0x80, 0xc3, 0xc9, 0x01, 0x00
++	};
++	CHECK(uvc_function_has_streaming(header, sizeof(header), 1));
++	CHECK(uvc_function_has_streaming(header, sizeof(header), 3));
++}
++
++
++static void
++test_collection_is_cut_to_the_header_length()
++{
++	// bInCollection claims two interfaces, but only the first one is there.
++	const uint8_t header[] = {
++		0x0d, 0x24, 0x01, 0x00, 0x01, 0x4e, 0x00, 0x80, 0xc3, 0xc9, 0x01, 0x02,
++		0x01, 0x03
++	};
++	CHECK(uvc_function_has_streaming(header, 13, 1));
++	CHECK(!uvc_function_has_streaming(header, 13, 3));
++
++	// Nothing of the list is there: as if the header had none.
++	CHECK(uvc_function_has_streaming(header, kUVCControlHeaderLength, 3));
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_listed_streaming_interface_belongs);
++	RUN(test_streaming_interface_of_other_function_is_left_alone);
++	RUN(test_any_of_several_listed_interfaces_belongs);
++	RUN(test_without_header_every_interface_belongs);
++	RUN(test_empty_collection_takes_every_interface);
++	RUN(test_collection_is_cut_to_the_header_length);
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

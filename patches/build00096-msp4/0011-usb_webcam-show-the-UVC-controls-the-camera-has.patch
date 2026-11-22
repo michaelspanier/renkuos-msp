@@ -1,0 +1,1050 @@
+From a1d8472087ed5a65a8c6d2fe9e906f6d8ff84b5c Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:27:42 +0000
+Subject: [PATCH 11/43] usb_webcam: show the UVC controls the camera has
+
+The parameter web read every control as two bytes, whatever its real
+size, and "Hue Auto" switched the automatic white balance
+temperature instead.
+
+The controls now come from the table in UVCControls.h: only those
+the bmControls fields of the processing unit and the camera terminal
+announce appear, each read with its own size and with the range and
+step the camera reports. A control with two values becomes a switch,
+the power line frequency a choice. Values are clamped to the range
+before they are written, and every control transfer checks the
+length it moved. The exposure controls of the camera terminal are
+new; "Allow Lower Frame Rate" is the auto exposure priority, which
+explains low frame rates in the dark.
+
+Tested with the C920 (12 controls) and the built-in camera of a
+ThinkPad T470s (13 controls).
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit b3a51dc035674ae29e724a6a45a5fcc3b149477e)
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 832 +++++++++---------
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  57 +-
+ 2 files changed, 449 insertions(+), 440 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index e9a22ed0e2..8275f38d2b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -8,10 +8,12 @@
+ 
+ #include "UVCCamDevice.h"
+ #include "UVCColor.h"
++#include "UVCControls.h"
+ #include "UVCDeframer.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <ParameterWeb.h>
+ #include <media/Buffer.h>
+ 
+@@ -73,6 +75,14 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fUncompressedFormatIndex(1),
+ 	fUncompressedFrameIndex(1)
+ {
++	fControlRequestIndex = 0;
++	fCameraRequestIndex = 0;
++	fCameraControls = 0;
++	fProcessingControls[0] = 0;
++	fProcessingControls[1] = 0;
++	for (int32 i = 0; i < kUvcParameterCount; i++)
++		fControls[i].kind = kUvcControlNone;
++
+ 	fDeframer = new UVCDeframer(this);
+ 	SetDataInput(fDeframer);
+ 
+@@ -433,6 +443,9 @@ UVCCamDevice::_ParseVideoControl(const usbvc_class_descriptor* _descriptor,
+ 			if (descriptor->terminalType == 0x201) {
+ 				const usb_video_camera_terminal_descriptor* desc
+ 					= (const usb_video_camera_terminal_descriptor*)descriptor;
++				fCameraRequestIndex = fControlIndex + (descriptor->terminalID << 8);
++				if (len > 15 && desc->control_size >= 1)
++					fCameraControls = ((const uint8*)descriptor)[15];
+ 				printf("\tObjectiveFocalLength Min/Max %d/%d\n",
+ 					desc->objective_focal_length_min,
+ 					desc->objective_focal_length_max);
+@@ -472,6 +485,10 @@ UVCCamDevice::_ParseVideoControl(const usbvc_class_descriptor* _descriptor,
+ 			const usb_video_processing_unit_descriptor* descriptor
+ 				= (const usb_video_processing_unit_descriptor*)_descriptor;
+ 			fControlRequestIndex = fControlIndex + (descriptor->unit_id << 8);
++			for (uint8 i = 0; i < 2; i++) {
++				if (i < descriptor->control_size)
++					fProcessingControls[i] = descriptor->controls[i];
++			}
+ 			printf("VC_PROCESSING_UNIT:\t unit id=%d,src id=%d, digmul=%d\n",
+ 				descriptor->unit_id, descriptor->source_id,
+ 				descriptor->max_multiplier);
+@@ -871,231 +888,371 @@ UVCCamDevice::_SelectIdleAlternate()
+ }
+ 
+ 
++struct ParameterLayout {
++	const char*	group;
++	const char*	name;
++};
++
++
++// One entry per parameter, in the order of the parameter numbers.
++static const ParameterLayout kLayout[kUvcParameterCount] = {
++	{ "Brightness", "Brightness" },
++	{ "Contrast", "Contrast" },
++	{ "Hue", "Hue" },
++	{ "Hue", "Auto" },
++	{ "Saturation", "Saturation" },
++	{ "Sharpness", "Sharpness" },
++	{ "Gamma", "Gamma" },
++	{ "White Balance Temperature", "WB Temperature" },
++	{ "White Balance Temperature", "Auto" },
++	{ "White Balance Component", "WB Blue" },
++	{ "White Balance Component", "Auto" },
++	{ "Backlight Compensation", "Backlight Compensation" },
++	{ "Gain", "Gain" },
++	{ "Power Line Frequency", "Frequency" },
++	{ "White Balance Component", "WB Red" },
++	{ "Exposure", "Auto" },
++	{ "Exposure", "Exposure Time" },
++	{ "Exposure", "Allow Lower Frame Rate" }
++};
++
++
++// The order in which the parameters appear in a group: the automatic switch
++// after the values it governs.
++static const int32 kCreationOrder[kUvcParameterCount] = {
++	kUvcParameterBrightness, kUvcParameterContrast, kUvcParameterHue, kUvcParameterHueAuto,
++	kUvcParameterSaturation, kUvcParameterSharpness, kUvcParameterGamma,
++	kUvcParameterWhiteBalanceTemperature, kUvcParameterWhiteBalanceTemperatureAuto,
++	kUvcParameterWhiteBalanceBlue, kUvcParameterWhiteBalanceRed,
++	kUvcParameterWhiteBalanceComponentAuto, kUvcParameterBacklightCompensation,
++	kUvcParameterGain, kUvcParameterPowerLineFrequency, kUvcParameterExposureAuto,
++	kUvcParameterExposureTime, kUvcParameterExposureFrameRate
++};
++
++
+ void
+-UVCCamDevice::_AddProcessingParameter(BParameterGroup* group,
+-	int32 index, const usb_video_processing_unit_descriptor* descriptor)
++UVCCamDevice::_DefineControl(int32 parameter, UVCControlKind kind, uint8 selector,
++	uint16 requestIndex, uint8 length, int32 autoParameter)
+ {
+-	BParameterGroup* subgroup;
+-	uint16 wValue = 0; // Control Selector
+-	float minValue = 0.0;
+-	float maxValue = 100.0;
+-	if (descriptor->control_size >= 1) {
+-		if (descriptor->controls[0] & 1) {
+-			// debug_printf("\tBRIGHTNESS\n");
+-			fBrightness = _AddParameter(group, &subgroup, index,
+-				USB_VIDEO_PU_BRIGHTNESS_CONTROL, "Brightness");
+-		}
+-		if (descriptor->controls[0] & 2) {
+-			// debug_printf("\tCONSTRAST\n");
+-			fContrast = _AddParameter(group, &subgroup, index + 1,
+-				USB_VIDEO_PU_CONTRAST_CONTROL, "Contrast");
+-		}
+-		if (descriptor->controls[0] & 4) {
+-			// debug_printf("\tHUE\n");
+-			fHue = _AddParameter(group, &subgroup, index + 2,
+-				USB_VIDEO_PU_HUE_CONTROL, "Hue");
+-			if (descriptor->control_size >= 2) {
+-				if (descriptor->controls[1] & 8) {
+-					fHueAuto = _AddAutoParameter(subgroup, index + 3,
+-						USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL);
+-				}
+-			}
+-		}
+-		if (descriptor->controls[0] & 8) {
+-			// debug_printf("\tSATURATION\n");
+-			fSaturation = _AddParameter(group, &subgroup, index + 4,
+-				USB_VIDEO_PU_SATURATION_CONTROL, "Saturation");
+-		}
+-		if (descriptor->controls[0] & 16) {
+-			// debug_printf("\tSHARPNESS\n");
+-			fSharpness = _AddParameter(group, &subgroup, index + 5,
+-				USB_VIDEO_PU_SHARPNESS_CONTROL, "Sharpness");
+-		}
+-		if (descriptor->controls[0] & 32) {
+-			// debug_printf("\tGamma\n");
+-			fGamma = _AddParameter(group, &subgroup, index + 6,
+-				USB_VIDEO_PU_GAMMA_CONTROL, "Gamma");
+-		}
+-		if (descriptor->controls[0] & 64) {
+-			// debug_printf("\tWHITE BALANCE TEMPERATURE\n");
+-			fWBTemp = _AddParameter(group, &subgroup, index + 7,
+-				USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_CONTROL, "WB Temperature");
+-			if (descriptor->control_size >= 2) {
+-				if (descriptor->controls[1] & 16) {
+-					fWBTempAuto = _AddAutoParameter(subgroup, index + 8,
+-						USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL);
+-				}
+-			}
+-		}
+-		if (descriptor->controls[0] & 128) {
+-			// debug_printf("\tWhite Balance Component\n");
+-			fWBComponent = _AddParameter(group, &subgroup, index + 9,
+-				USB_VIDEO_PU_WHITE_BALANCE_COMPONENT_CONTROL, "WB Component");
+-			if (descriptor->control_size >= 2) {
+-				if (descriptor->controls[1] & 32) {
+-					fWBTempAuto = _AddAutoParameter(subgroup, index + 10,
+-						USB_VIDEO_PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL);
+-				}
+-			}
+-		}
++	UVCControl& control = fControls[parameter];
++	control.kind = kind;
++	control.selector = selector;
++	control.requestIndex = requestIndex;
++	control.length = length;
++	control.autoParameter = autoParameter;
++	control.minimum = 0;
++	control.maximum = 100;
++	control.value = 0;
++}
++
++
++/*!	Decides from the descriptors which controls the camera has. The bit
++	numbers are those of the UVC specification: Processing Unit byte 0 and 1,
++	Camera Terminal byte 0.
++*/
++void
++UVCCamDevice::_DefineControls()
++{
++	for (int32 i = 0; i < kUvcParameterCount; i++)
++		fControls[i].kind = kUvcControlNone;
++
++	const uint16 unit = fControlRequestIndex;
++	const uint8 first = fProcessingControls[0];
++	const uint8 second = fProcessingControls[1];
++
++	if ((first & 0x01) != 0) {
++		_DefineControl(kUvcParameterBrightness, kUvcControlRange,
++			USB_VIDEO_PU_BRIGHTNESS_CONTROL, unit, 2, -1);
+ 	}
+-	if (descriptor->control_size >= 2) {
+-		if (descriptor->controls[1] & 1) {
+-			// debug_printf("\tBACKLIGHT COMPENSATION\n");
+-			int16 data;
+-			wValue = USB_VIDEO_PU_BACKLIGHT_COMPENSATION_CONTROL << 8;
+-			fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-				USB_VIDEO_RC_GET_MAX, wValue, fControlRequestIndex, sizeof(data), &data);
+-			maxValue = (float)data;
+-			fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-				USB_VIDEO_RC_GET_MIN, wValue, fControlRequestIndex, sizeof(data), &data);
+-			minValue = (float)data;
+-			fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-				USB_VIDEO_RC_GET_CUR, wValue, fControlRequestIndex, sizeof(data), &data);
+-			fBacklightCompensation = (float)data;
+-			subgroup = group->MakeGroup("Backlight Compensation");
+-			if (maxValue - minValue == 1) { // Binary Switch
+-				fBinaryBacklightCompensation = true;
+-				subgroup->MakeDiscreteParameter(index + 11,
+-					B_MEDIA_RAW_VIDEO, "Backlight Compensation",
+-					B_ENABLE);
+-			} else { // Range of values
+-				fBinaryBacklightCompensation = false;
+-				subgroup->MakeContinuousParameter(index + 11,
+-				B_MEDIA_RAW_VIDEO, "Backlight Compensation",
+-				B_GAIN, "", minValue, maxValue, 1.0 / (maxValue - minValue));
+-			}
+-		}
+-		if (descriptor->controls[1] & 2) {
+-			// debug_printf("\tGAIN\n");
+-			fGain = _AddParameter(group, &subgroup, index + 12, USB_VIDEO_PU_GAIN_CONTROL,
+-				"Gain");
+-		}
+-		if (descriptor->controls[1] & 4) {
+-			// debug_printf("\tPOWER LINE FREQUENCY\n");
+-			wValue = USB_VIDEO_PU_POWER_LINE_FREQUENCY_CONTROL << 8;
+-			int8 data;
+-			if (fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-					USB_VIDEO_RC_GET_CUR, wValue, fControlRequestIndex, sizeof(data), &data)
+-				== sizeof(data)) {
+-				fPowerlineFrequency = data;
+-			}
+-			subgroup = group->MakeGroup("Power Line Frequency");
+-			subgroup->MakeContinuousParameter(index + 13,
+-				B_MEDIA_RAW_VIDEO, "Frequency", B_GAIN, "", 0, 60.0, 1.0 / 60.0);
+-		}
+-		// TODO Determine whether controls apply to these
+-		/*
+-		if (descriptor->controls[1] & 64)
+-			debug_printf("\tDigital Multiplier\n");
+-		if (descriptor->controls[1] & 128)
+-			debug_printf("\tDigital Multiplier Limit\n");
+-		*/
++	if ((first & 0x02) != 0) {
++		_DefineControl(kUvcParameterContrast, kUvcControlRange,
++			USB_VIDEO_PU_CONTRAST_CONTROL, unit, 2, -1);
+ 	}
+-	// TODO Determine whether controls apply to these
+-	/*
+-	if (descriptor->controlSize >= 3) {
+-		if (descriptor->controls[2] & 1)
+-			debug_printf("\tAnalog Video Standard\n");
+-		if (descriptor->controls[2] & 2)
+-			debug_printf("\tAnalog Video Lock Status\n");
++	if ((first & 0x04) != 0) {
++		_DefineControl(kUvcParameterHue, kUvcControlRange, USB_VIDEO_PU_HUE_CONTROL,
++			unit, 2, (second & 0x08) != 0 ? kUvcParameterHueAuto : -1);
++	}
++	if ((second & 0x08) != 0) {
++		_DefineControl(kUvcParameterHueAuto, kUvcControlSwitch,
++			USB_VIDEO_PU_HUE_AUTO_CONTROL, unit, 1, -1);
++	}
++	if ((first & 0x08) != 0) {
++		_DefineControl(kUvcParameterSaturation, kUvcControlRange,
++			USB_VIDEO_PU_SATURATION_CONTROL, unit, 2, -1);
++	}
++	if ((first & 0x10) != 0) {
++		_DefineControl(kUvcParameterSharpness, kUvcControlRange,
++			USB_VIDEO_PU_SHARPNESS_CONTROL, unit, 2, -1);
++	}
++	if ((first & 0x20) != 0) {
++		_DefineControl(kUvcParameterGamma, kUvcControlRange,
++			USB_VIDEO_PU_GAMMA_CONTROL, unit, 2, -1);
++	}
++	if ((first & 0x40) != 0) {
++		_DefineControl(kUvcParameterWhiteBalanceTemperature, kUvcControlRange,
++			USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_CONTROL, unit, 2,
++			(second & 0x10) != 0 ? kUvcParameterWhiteBalanceTemperatureAuto : -1);
++	}
++	if ((second & 0x10) != 0) {
++		_DefineControl(kUvcParameterWhiteBalanceTemperatureAuto, kUvcControlSwitch,
++			USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL, unit, 1, -1);
++	}
++	if ((first & 0x80) != 0) {
++		// Blue and red share one control of four bytes.
++		const int32 automatic
++			= (second & 0x20) != 0 ? kUvcParameterWhiteBalanceComponentAuto : -1;
++		_DefineControl(kUvcParameterWhiteBalanceBlue, kUvcControlRange,
++			USB_VIDEO_PU_WHITE_BALANCE_COMPONENT_CONTROL, unit, 4, automatic);
++		_DefineControl(kUvcParameterWhiteBalanceRed, kUvcControlRange,
++			USB_VIDEO_PU_WHITE_BALANCE_COMPONENT_CONTROL, unit, 4, automatic);
++	}
++	if ((second & 0x20) != 0) {
++		_DefineControl(kUvcParameterWhiteBalanceComponentAuto, kUvcControlSwitch,
++			USB_VIDEO_PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL, unit, 1, -1);
++	}
++	if ((second & 0x01) != 0) {
++		_DefineControl(kUvcParameterBacklightCompensation, kUvcControlRange,
++			USB_VIDEO_PU_BACKLIGHT_COMPENSATION_CONTROL, unit, 2, -1);
++	}
++	if ((second & 0x02) != 0) {
++		_DefineControl(kUvcParameterGain, kUvcControlRange, USB_VIDEO_PU_GAIN_CONTROL,
++			unit, 2, -1);
++	}
++	if ((second & 0x04) != 0) {
++		_DefineControl(kUvcParameterPowerLineFrequency, kUvcControlChoice,
++			USB_VIDEO_PU_POWER_LINE_FREQUENCY_CONTROL, unit, 1, -1);
+ 	}
+-	*/
+ 
++	const uint16 camera = fCameraRequestIndex;
++	const uint8 terminal = fCameraControls;
++	if ((terminal & 0x02) != 0) {
++		_DefineControl(kUvcParameterExposureAuto, kUvcControlExposureMode,
++			USB_VIDEO_CT_AE_MODE_CONTROL, camera, 1, -1);
++	}
++	if ((terminal & 0x08) != 0) {
++		_DefineControl(kUvcParameterExposureTime, kUvcControlRange,
++			USB_VIDEO_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL, camera, 4,
++			(terminal & 0x02) != 0 ? kUvcParameterExposureAuto : -1);
++	}
++	if ((terminal & 0x04) != 0) {
++		_DefineControl(kUvcParameterExposureFrameRate, kUvcControlSwitch,
++			USB_VIDEO_CT_AE_PRIORITY_CONTROL, camera, 1, -1);
++	}
+ }
+ 
+ 
+-
+-float
+-UVCCamDevice::_AddParameter(BParameterGroup* group,
+-	BParameterGroup** subgroup, int32 index, uint16 wValue, const char* name)
++bool
++UVCCamDevice::_ReadControl(const UVCControl& control, uint8 request, uint8* data)
+ {
+-	float minValue = 0.0;
+-	float maxValue = 100.0;
+-	float currValue = 0.0;
+-	int16 data;
++	ssize_t transferred = fDevice->ControlTransfer(USB_REQTYPE_CLASS
++		| USB_REQTYPE_INTERFACE_IN, request, control.selector << 8,
++		control.requestIndex, control.length, data);
++	return uvc_transfer_succeeded(transferred, control.length);
++}
+ 
+-	wValue <<= 8;
+ 
+-	if (fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-		USB_VIDEO_RC_GET_MAX, wValue, fControlRequestIndex, sizeof(data), &data)
+-		== sizeof(data)) {
+-		maxValue = (float)data;
++/*!	Asks the camera for the range and the current value of a control. A
++	control that does not answer keeps the defaults.
++*/
++void
++UVCCamDevice::_LoadControl(int32 parameter)
++{
++	UVCControl& control = fControls[parameter];
++	uint8 data[4];
++	const bool isSigned = control.selector != USB_VIDEO_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL
++		|| control.requestIndex != fCameraRequestIndex;
++
++	if (control.kind == kUvcControlRange) {
++		if (control.length == 4 && control.requestIndex == fControlRequestIndex) {
++			_LoadWhiteBalanceComponent();
++			return;
++		}
++		if (_ReadControl(control, USB_VIDEO_RC_GET_MIN, data))
++			control.minimum = uvc_decode_value(data, control.length, isSigned);
++		if (_ReadControl(control, USB_VIDEO_RC_GET_MAX, data))
++			control.maximum = uvc_decode_value(data, control.length, isSigned);
++		if (_ReadControl(control, USB_VIDEO_RC_GET_CUR, data))
++			control.value = uvc_decode_value(data, control.length, isSigned);
++
++		// A range of two values is a switch.
++		if (control.maximum - control.minimum == 1) {
++			control.kind = kUvcControlSwitch;
++			control.value = control.value != control.minimum ? 1 : 0;
++		}
++		return;
+ 	}
+-	if (fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-		USB_VIDEO_RC_GET_MIN, wValue, fControlRequestIndex, sizeof(data), &data)
+-		== sizeof(data)) {
+-		minValue = (float)data;
++
++	if (control.kind == kUvcControlExposureMode) {
++		uint8 supported = 0;
++		if (_ReadControl(control, USB_VIDEO_RC_GET_RES, data))
++			supported = data[0];
++		control.maximum = supported;
+ 	}
+-	if (fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-		USB_VIDEO_RC_GET_CUR, wValue, fControlRequestIndex, sizeof(data), &data)
+-		== sizeof(data)) {
+-		currValue = (float)data;
++	if (_ReadControl(control, USB_VIDEO_RC_GET_CUR, data)) {
++		const int32 current = uvc_decode_value(data, control.length, false);
++		if (control.kind == kUvcControlExposureMode)
++			control.value = uvc_exposure_mode_is_automatic((uint8)current) ? 1 : 0;
++		else if (control.kind == kUvcControlSwitch)
++			control.value = current != 0 ? 1 : 0;
++		else
++			control.value = current;
+ 	}
++}
++
+ 
+-	*subgroup = group->MakeGroup(name);
+-	(*subgroup)->MakeContinuousParameter(index,
+-		B_MEDIA_RAW_VIDEO, name, B_GAIN, "", minValue, maxValue,
+-		1.0 / (maxValue - minValue));
+-	return currValue;
++/*!	Blue and red come in one control of two 16 bit values, blue first. */
++void
++UVCCamDevice::_LoadWhiteBalanceComponent()
++{
++	UVCControl& blue = fControls[kUvcParameterWhiteBalanceBlue];
++	UVCControl& red = fControls[kUvcParameterWhiteBalanceRed];
++	uint8 data[4];
++	int16 first, second;
++
++	if (_ReadControl(blue, USB_VIDEO_RC_GET_MIN, data)) {
++		uvc_unpack_pair(data, &first, &second);
++		blue.minimum = first;
++		red.minimum = second;
++	}
++	if (_ReadControl(blue, USB_VIDEO_RC_GET_MAX, data)) {
++		uvc_unpack_pair(data, &first, &second);
++		blue.maximum = first;
++		red.maximum = second;
++	}
++	if (_ReadControl(blue, USB_VIDEO_RC_GET_CUR, data)) {
++		uvc_unpack_pair(data, &first, &second);
++		blue.value = first;
++		red.value = second;
++	}
+ }
+ 
+ 
+-uint8
+-UVCCamDevice::_AddAutoParameter(BParameterGroup* subgroup, int32 index,
+-	uint16 wValue)
++/*!	Sends the stored value of a control to the camera. */
++status_t
++UVCCamDevice::_WriteControl(int32 parameter)
+ {
+-	uint8 data;
+-	wValue <<= 8;
++	const UVCControl& control = fControls[parameter];
++	uint8 data[4];
++	uint8 length = control.length;
++
++	if (control.kind == kUvcControlExposureMode) {
++		const uint8 mode = uvc_exposure_mode(control.value != 0,
++			(uint8)control.maximum);
++		if (mode == 0)
++			return B_NOT_SUPPORTED;
++		uvc_encode_value(mode, 1, data);
++	} else if (control.kind == kUvcControlRange && length == 4
++		&& control.requestIndex == fControlRequestIndex) {
++		uvc_pack_pair((int16)fControls[kUvcParameterWhiteBalanceBlue].value,
++			(int16)fControls[kUvcParameterWhiteBalanceRed].value, data);
++	} else
++		uvc_encode_value(control.value, length, data);
++
++	ssize_t transferred = fDevice->ControlTransfer(USB_REQTYPE_CLASS
++		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, control.selector << 8,
++		control.requestIndex, length, data);
++	return uvc_transfer_succeeded(transferred, length) ? B_OK : B_ERROR;
++}
+ 
+-	fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-		USB_VIDEO_RC_GET_CUR, wValue, fControlRequestIndex, 1, &data);
+-	subgroup->MakeDiscreteParameter(index, B_MEDIA_RAW_VIDEO, "Auto",
+-		B_ENABLE);
+ 
+-	return data;
++/*!	While the camera adjusts a value on its own, it shows the current value. */
++void
++UVCCamDevice::_RefreshAutomaticValue(int32 parameter)
++{
++	UVCControl& control = fControls[parameter];
++	if (control.kind != kUvcControlRange || control.autoParameter < 0
++		|| fControls[control.autoParameter].value == 0)
++		return;
++
++	uint8 data[4];
++	if (!_ReadControl(control, USB_VIDEO_RC_GET_CUR, data))
++		return;
++
++	if (control.length == 4 && control.requestIndex == fControlRequestIndex) {
++		int16 blue, red;
++		uvc_unpack_pair(data, &blue, &red);
++		fControls[kUvcParameterWhiteBalanceBlue].value = blue;
++		fControls[kUvcParameterWhiteBalanceRed].value = red;
++	} else {
++		const bool isSigned = control.requestIndex != fCameraRequestIndex;
++		control.value = uvc_decode_value(data, control.length, isSigned);
++	}
+ }
+ 
+ 
+ void
+ UVCCamDevice::AddParameters(BParameterGroup* group, int32& index)
+ {
+-	printf("UVCCamDevice::AddParameters()\n");
+ 	fFirstParameterID = index;
+-//	debug_printf("fIndex = %d\n",fIndex);
+ 	CamDevice::AddParameters(group, index);
+ 
+-	const BUSBConfiguration* config;
+-	const BUSBInterface* interface;
+-	uint8 buffer[1024];
++	_DefineControls();
++	for (int32 i = 0; i < kUvcParameterCount; i++) {
++		if (fControls[i].kind != kUvcControlNone)
++			_LoadControl(i);
++	}
+ 
+-	usb_descriptor* generic = (usb_descriptor*)buffer;
++	BParameterGroup* groups[kUvcParameterCount];
++	for (int32 i = 0; i < kUvcParameterCount; i++)
++		groups[i] = NULL;
+ 
+-	for (uint32 i = 0; i < fDevice->CountConfigurations(); i++) {
+-		config = fDevice->ConfigurationAt(i);
+-		if (config == NULL)
++	for (int32 i = 0; i < kUvcParameterCount; i++) {
++		const int32 parameter = kCreationOrder[i];
++		if (fControls[parameter].kind == kUvcControlNone)
+ 			continue;
+-		fDevice->SetConfiguration(config);
+-		for (uint32 j = 0; j < config->CountInterfaces(); j++) {
+-			interface = config->InterfaceAt(j);
+-			if (interface == NULL)
+-				continue;
+-			if (interface->Class() != USB_VIDEO_DEVICE_CLASS || interface->Subclass()
+-				!= USB_VIDEO_INTERFACE_VIDEOCONTROL_SUBCLASS)
+-				continue;
+-			for (uint32 k = 0; interface->OtherDescriptorAt(k, generic,
+-				sizeof(buffer)) == B_OK; k++) {
+-				if (generic->generic.descriptor_type != (USB_REQTYPE_CLASS
+-					| USB_DESCRIPTOR_INTERFACE))
+-					continue;
+ 
+-				if (((const usbvc_class_descriptor*)generic)->descriptorSubtype
+-					== USB_VIDEO_VC_PROCESSING_UNIT) {
+-					_AddProcessingParameter(group, index,
+-						(const usb_video_processing_unit_descriptor*)generic);
+-				}
+-			}
++		groups[parameter] = _GroupFor(group, groups, parameter);
++		_MakeParameter(groups[parameter], parameter);
++	}
++
++	index += kUvcParameterCount;
++}
++
++
++/*!	All parameters of one feature share a group, named like the feature. */
++BParameterGroup*
++UVCCamDevice::_GroupFor(BParameterGroup* group, BParameterGroup** groups,
++	int32 parameter)
++{
++	for (int32 i = 0; i < kUvcParameterCount; i++) {
++		if (groups[i] != NULL
++			&& strcmp(kLayout[i].group, kLayout[parameter].group) == 0)
++			return groups[i];
++	}
++	return group->MakeGroup(kLayout[parameter].group);
++}
++
++
++void
++UVCCamDevice::_MakeParameter(BParameterGroup* group, int32 parameter)
++{
++	const UVCControl& control = fControls[parameter];
++	const int32 id = fFirstParameterID + parameter;
++	const char* name = kLayout[parameter].name;
++
++	switch (control.kind) {
++		case kUvcControlRange:
++			group->MakeContinuousParameter(id, B_MEDIA_RAW_VIDEO, name, B_GAIN,
++				"", control.minimum, control.maximum, 1.0);
++			break;
++
++		case kUvcControlChoice:
++		{
++			BDiscreteParameter* choice = group->MakeDiscreteParameter(id,
++				B_MEDIA_RAW_VIDEO, name, B_INPUT_MUX);
++			choice->AddItem(0, "Off");
++			choice->AddItem(1, "50 Hz");
++			choice->AddItem(2, "60 Hz");
++			break;
+ 		}
++
++		case kUvcControlSwitch:
++		case kUvcControlExposureMode:
++			group->MakeDiscreteParameter(id, B_MEDIA_RAW_VIDEO, name, B_ENABLE);
++			break;
++
++		default:
++			break;
+ 	}
+ }
+ 
+@@ -1104,119 +1261,27 @@ status_t
+ UVCCamDevice::GetParameterValue(int32 id, bigtime_t* last_change, void* value,
+ 	size_t* size)
+ {
+-	printf("UVCCAmDevice::GetParameterValue(%" B_PRId32 ")\n", id - fFirstParameterID);
+-	float* currValue;
+-	int* currValueInt;
+-	int16 data;
+-	uint16 wValue = 0;
+-	switch (id - fFirstParameterID) {
+-		case 0:
+-			// debug_printf("\tBrightness:\n");
+-			// debug_printf("\tValue = %f\n",fBrightness);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fBrightness;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 1:
+-			// debug_printf("\tContrast:\n");
+-			// debug_printf("\tValue = %f\n",fContrast);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fContrast;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 2:
+-			// debug_printf("\tHue:\n");
+-			// debug_printf("\tValue = %f\n",fHue);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fHue;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 4:
+-			// debug_printf("\tSaturation:\n");
+-			// debug_printf("\tValue = %f\n",fSaturation);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fSaturation;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 5:
+-			// debug_printf("\tSharpness:\n");
+-			// debug_printf("\tValue = %f\n",fSharpness);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fSharpness;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 7:
+-			// debug_printf("\tWB Temperature:\n");
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			wValue = USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_CONTROL << 8;
+-			if (fDevice->ControlTransfer(USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN,
+-				USB_VIDEO_RC_GET_CUR, wValue, fControlRequestIndex, sizeof(data), &data)
+-				== sizeof(data)) {
+-				fWBTemp = (float)data;
+-			}
+-			// debug_printf("\tValue = %f\n",fWBTemp);
+-			*currValue = fWBTemp;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 8:
+-			// debug_printf("\tWB Temperature Auto:\n");
+-			// debug_printf("\tValue = %d\n",fWBTempAuto);
+-			*size = sizeof(int);
+-			currValueInt = ((int*)value);
+-			*currValueInt = fWBTempAuto;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 11:
+-			if (!fBinaryBacklightCompensation) {
+-				// debug_printf("\tBacklight Compensation:\n");
+-				// debug_printf("\tValue = %f\n",fBacklightCompensation);
+-				*size = sizeof(float);
+-				currValue = (float*)value;
+-				*currValue = fBacklightCompensation;
+-				*last_change = fLastParameterChanges;
+-			} else {
+-				// debug_printf("\tBacklight Compensation:\n");
+-				// debug_printf("\tValue = %d\n",fBacklightCompensationBinary);
+-				currValueInt = (int*)value;
+-				*currValueInt = fBacklightCompensationBinary;
+-				*last_change = fLastParameterChanges;
+-			}
+-			return B_OK;
+-		case 12:
+-			// debug_printf("\tGain:\n");
+-			// debug_printf("\tValue = %f\n",fGain);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			*currValue = fGain;
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-		case 13:
+-			// debug_printf("\tPowerline Frequency:\n");
+-			// debug_printf("\tValue = %d\n",fPowerlineFrequency);
+-			*size = sizeof(float);
+-			currValue = (float*)value;
+-			switch (fPowerlineFrequency) {
+-				case 0:
+-					*currValue = 0.0;
+-					break;
+-				case 1:
+-					*currValue = 50.0;
+-					break;
+-				case 2:
+-					*currValue = 60.0;
+-					break;
+-			}
+-			*last_change = fLastParameterChanges;
+-			return B_OK;
+-
+-	}
+-	return B_BAD_VALUE;
++	const int32 parameter = id - fFirstParameterID;
++	if (parameter < 0 || parameter >= kUvcParameterCount)
++		return B_BAD_VALUE;
++
++	const UVCControl& control = fControls[parameter];
++	if (control.kind == kUvcControlNone)
++		return B_BAD_VALUE;
++
++	const bool isNumber = control.kind == kUvcControlRange;
++	const size_t valueSize = isNumber ? sizeof(float) : sizeof(int32);
++	if (*size < valueSize)
++		return B_BAD_VALUE;
++
++	_RefreshAutomaticValue(parameter);
++	if (isNumber)
++		*(float*)value = (float)control.value;
++	else
++		*(int32*)value = control.value;
++	*size = valueSize;
++	*last_change = fLastParameterChanges;
++	return B_OK;
+ }
+ 
+ 
+@@ -1224,120 +1289,75 @@ status_t
+ UVCCamDevice::SetParameterValue(int32 id, bigtime_t when, const void* value,
+ 	size_t size)
+ {
+-	printf("UVCCamDevice::SetParameterValue(%" B_PRId32 ")\n", id - fFirstParameterID);
+-	switch (id - fFirstParameterID) {
+-		case 0:
+-			// debug_printf("\tBrightness:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fBrightness = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_BRIGHTNESS_CONTROL, (int16)fBrightness);
+-		case 1:
+-			// debug_printf("\tContrast:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fContrast = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_CONTRAST_CONTROL, (int16)fContrast);
+-		case 2:
+-			// debug_printf("\tHue:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fHue = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_HUE_CONTROL, (int16)fHue);
+-		case 4:
+-			// debug_printf("\tSaturation:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fSaturation = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_SATURATION_CONTROL, (int16)fSaturation);
+-		case 5:
+-			// debug_printf("\tSharpness:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fSharpness = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_SHARPNESS_CONTROL, (int16)fSharpness);
+-		case 7:
+-			if (fWBTempAuto)
+-				return B_OK;
+-			// debug_printf("\tWB Temperature:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fWBTemp = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_CONTROL,
+-				(int16)fWBTemp);
+-		case 8:
+-			// debug_printf("\tWB Temperature Auto:\n");
+-			if (!value || (size != sizeof(int)))
+-				return B_BAD_VALUE;
+-			fWBTempAuto = *((int*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(
+-				USB_VIDEO_PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL, (int8)fWBTempAuto);
+-		case 11:
+-			if (!fBinaryBacklightCompensation) {
+-				// debug_printf("\tBacklight Compensation:\n");
+-				if (!value || (size != sizeof(float)))
+-					return B_BAD_VALUE;
+-				fBacklightCompensation = *((float*)value);
+-			} else {
+-				// debug_printf("\tBacklight Compensation:\n");
+-				if (!value || (size != sizeof(int)))
+-					return B_BAD_VALUE;
+-				fBacklightCompensationBinary = *((int*)value);
+-			}
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_BACKLIGHT_COMPENSATION_CONTROL,
+-				(int16)fBacklightCompensationBinary);
+-		case 12:
+-			// debug_printf("\tGain:\n");
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			fGain = *((float*)value);
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_GAIN_CONTROL, (int16)fGain);
+-		case 13:
+-			// debug_printf("\tPowerline Frequency:\n");
+-			// debug_printf("\tValue = %f\n",*((float*)value));
+-			if (!value || (size != sizeof(float)))
+-				return B_BAD_VALUE;
+-			float inValue = *((float*)value);
+-			fPowerlineFrequency = 0;
+-			if (inValue > 45.0 && inValue < 55.0) {
+-				fPowerlineFrequency = 1;
+-			}
+-			if (inValue >= 55.0) {
+-				fPowerlineFrequency = 2;
+-			}
+-			fLastParameterChanges = when;
+-			return _SetParameterValue(USB_VIDEO_PU_POWER_LINE_FREQUENCY_CONTROL,
+-				(int8)fPowerlineFrequency);
+-
++	const int32 parameter = id - fFirstParameterID;
++	if (parameter < 0 || parameter >= kUvcParameterCount)
++		return B_BAD_VALUE;
++
++	UVCControl& control = fControls[parameter];
++	if (control.kind == kUvcControlNone || value == NULL)
++		return B_BAD_VALUE;
++
++	if (control.kind == kUvcControlRange) {
++		if (size != sizeof(float))
++			return B_BAD_VALUE;
++		control.value = uvc_clamp_control_value(*(const float*)value,
++			control.minimum, control.maximum);
++	} else {
++		if (size != sizeof(int32))
++			return B_BAD_VALUE;
++		const int32 requested = *(const int32*)value;
++		control.value = control.kind == kUvcControlChoice
++			? uvc_clamp_control_value((float)requested, 0, 2)
++			: (requested != 0 ? 1 : 0);
+ 	}
+-	return B_BAD_VALUE;
++	fLastParameterChanges = when;
++
++	// The camera ignores a value that it adjusts on its own.
++	if (control.autoParameter >= 0 && fControls[control.autoParameter].value != 0)
++		return B_OK;
++
++	status_t status = _WriteControl(parameter);
++	if (status == B_OK && _IsAutomaticSwitch(parameter) && control.value == 0)
++		status = _WriteDependentValues(parameter);
++	return status;
+ }
+ 
+ 
+-status_t
+-UVCCamDevice::_SetParameterValue(uint16 wValue, int16 setValue)
++bool
++UVCCamDevice::_IsAutomaticSwitch(int32 parameter) const
+ {
+-	return (fDevice->ControlTransfer(USB_REQTYPE_CLASS
+-		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, wValue << 8, fControlRequestIndex,
+-		sizeof(setValue), &setValue)) == sizeof(setValue);
++	for (int32 i = 0; i < kUvcParameterCount; i++) {
++		if (fControls[i].kind != kUvcControlNone && fControls[i].autoParameter == parameter)
++			return true;
++	}
++	return false;
+ }
+ 
+ 
++/*!	When the camera stops adjusting a value, it takes the one the user last
++	chose. Returns the first error, but writes the other values anyway.
++*/
+ status_t
+-UVCCamDevice::_SetParameterValue(uint16 wValue, int8 setValue)
++UVCCamDevice::_WriteDependentValues(int32 automaticParameter)
+ {
+-	return (fDevice->ControlTransfer(USB_REQTYPE_CLASS
+-		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, wValue << 8, fControlRequestIndex,
+-		sizeof(setValue), &setValue)) == sizeof(setValue);
++	status_t result = B_OK;
++	bool pairWritten = false;
++	for (int32 i = 0; i < kUvcParameterCount; i++) {
++		const UVCControl& control = fControls[i];
++		if (control.kind == kUvcControlNone || control.autoParameter != automaticParameter)
++			continue;
++
++		// Blue and red go out together, once.
++		const bool isPair = i == kUvcParameterWhiteBalanceBlue
++			|| i == kUvcParameterWhiteBalanceRed;
++		if (isPair && pairWritten)
++			continue;
++		pairWritten = pairWritten || isPair;
++		status_t status = _WriteControl(i);
++		if (status != B_OK && result == B_OK)
++			result = status;
++	}
++	return result;
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 8737a9e834..07bd5725cc 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -9,6 +9,7 @@
+ 
+ 
+ #include "CamDevice.h"
++#include "UVCControls.h"
+ #include "USB_video.h"
+ #include <usb/USB_video.h>
+ 
+@@ -53,20 +54,24 @@ private:
+ 			uint32				_DefaultFrameInterval() const;
+ 			status_t			_SelectIdleAlternate();
+ 
+-			void				_AddProcessingParameter(BParameterGroup* group,
+-									int32 index,
+-									const usb_video_processing_unit_descriptor*
+-										descriptor);
+-			float				_AddParameter(BParameterGroup* group,
+-									BParameterGroup** subgroup, int32 index,
+-									uint16 wValue, const char* name);
+-			uint8 				_AddAutoParameter(BParameterGroup* subgroup,
+-									int32 index, uint16 wValue);
+-			status_t			_SetParameterValue(uint16 wValue,
+-									int16 setValue);
+-			status_t			_SetParameterValue(uint16 wValue,
+-									int8 setValue);
+-
++			void				_DefineControl(int32 parameter,
++									UVCControlKind kind, uint8 selector,
++									uint16 requestIndex, uint8 length,
++									int32 autoParameter);
++			void				_DefineControls();
++			bool				_ReadControl(const UVCControl& control,
++									uint8 request, uint8* data);
++			void				_LoadControl(int32 parameter);
++			void				_LoadWhiteBalanceComponent();
++			status_t			_WriteControl(int32 parameter);
++			void				_RefreshAutomaticValue(int32 parameter);
++			bool				_IsAutomaticSwitch(int32 parameter) const;
++			status_t			_WriteDependentValues(
++									int32 automaticParameter);
++			BParameterGroup*	_GroupFor(BParameterGroup* group,
++									BParameterGroup** groups, int32 parameter);
++			void				_MakeParameter(BParameterGroup* group,
++									int32 parameter);
+ 
+ 			usbvc_interface_header_descriptor *fHeaderDescriptor;
+ 
+@@ -84,26 +89,10 @@ private:
+ 			BList				fUncompressedFrames;
+ 			BList				fMJPEGFrames;
+ 
+-			float				fBrightness;
+-			float				fContrast;
+-			float				fHue;
+-			float				fSaturation;
+-			float				fSharpness;
+-			float				fGamma;
+-			float				fWBTemp;
+-			float				fWBComponent;
+-			float				fBacklightCompensation;
+-			float				fGain;
+-
+-			bool				fBinaryBacklightCompensation;
+-
+-			int					fWBTempAuto;
+-			int					fWBCompAuto;
+-			int					fHueAuto;
+-			int					fBacklightCompensationBinary;
+-			int					fPowerlineFrequency;
+-
+-
++			uint16				fCameraRequestIndex;
++			uint8				fCameraControls;
++			uint8				fProcessingControls[2];
++			UVCControl			fControls[kUvcParameterCount];
+ };
+ 
+ 
+-- 
+2.54.1
+

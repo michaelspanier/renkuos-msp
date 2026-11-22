@@ -1,0 +1,303 @@
+From 8dd0aeea1e40601e34f770bc38b7c78603e33033 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 10:32:43 +0000
+Subject: [PATCH 22/43] hda: no controls for unconnected pins, record from ADC
+ 9 on the T470s
+
+msp: from HaikiDevKI's patch 2-hda.patch, not in any PR.
+---
+ .../kernel/drivers/audio/hda/hda_codec.cpp    |  53 ++++++--
+ .../drivers/audio/hda/hda_multi_audio.cpp     | 120 ++++++++++++------
+ 2 files changed, 124 insertions(+), 49 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+index 94ab47faad..9a16e9de91 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
++++ b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+@@ -977,6 +977,16 @@ hda_widget_find_output_path(hda_audio_group* audioGroup, hda_widget* widget,
+ }
+ 
+ 
++//!	Returns whether \a widget is a microphone built into the machine.
++static bool
++hda_widget_is_fixed_mic(const hda_widget* widget)
++{
++	return widget != NULL && widget->type == WT_PIN_COMPLEX
++		&& CONF_DEFAULT_CONNECTIVITY(widget->d.pin.config) == PIN_CONN_FIXED
++		&& CONF_DEFAULT_DEVICE(widget->d.pin.config) == PIN_DEV_MIC_IN;
++}
++
++
+ /*! Find input path for widget */
+ static bool
+ hda_widget_find_input_path(hda_audio_group* audioGroup, hda_widget* widget,
+@@ -1022,8 +1032,15 @@ hda_widget_find_input_path(hda_audio_group* audioGroup, hda_widget* widget,
+ 
+ 				if (hda_widget_find_input_path(audioGroup, inputWidget,
+ 						depth + 1)) {
+-					if (widget->active_input == -1)
++					// Default to the built-in microphone: a jack is likely
++					// empty, and then the machine would record silence.
++					if (widget->active_input == -1
++						|| (hda_widget_is_fixed_mic(inputWidget)
++							&& !hda_widget_is_fixed_mic(
++								hda_audio_group_get_widget(audioGroup,
++									widget->inputs[widget->active_input])))) {
+ 						widget->active_input = i;
++					}
+ 
+ 					widget->flags |= WIDGET_FLAG_INPUT_PATH;
+ 					TRACE("      %*sinput: added mixer/selector widget %"
+@@ -1096,6 +1113,26 @@ hda_audio_group_build_output_tree(hda_audio_group* audioGroup, bool useMixer)
+ }
+ 
+ 
++/*!	Returns whether \a widget is an ADC that must stay out of the input tree.
++
++	On the ALC298 of the X270 and the T470s, ADC 8 receives the external
++	microphone and ADC 9 the fixed internal one. In the tree, both converters
++	would be assigned channel 0 of the same two-channel capture stream, which
++	records silence, and ADC 8 would get mixer controls that act on nothing.
++	ADC 9 alone suffices: its selector reaches the external microphone too.
++*/
++static bool
++hda_widget_is_redundant_adc(hda_audio_group* audioGroup,
++	const hda_widget& widget)
++{
++	const hda_codec* codec = audioGroup->codec;
++	return widget.type == WT_AUDIO_INPUT && widget.node_id == 8
++		&& codec->vendor_id == 0x10ec && codec->product_id == 0x0298
++		&& (codec->subsystem_id == 0x17aa5062
++			|| codec->subsystem_id == 0x17aa224b);
++}
++
++
+ static bool
+ hda_audio_group_build_input_tree(hda_audio_group* audioGroup)
+ {
+@@ -1105,7 +1142,8 @@ hda_audio_group_build_input_tree(hda_audio_group* audioGroup)
+ 	for (uint32 i = 0; i < audioGroup->widget_count; i++) {
+ 		hda_widget& widget = audioGroup->widgets[i];
+ 
+-		if (widget.type != WT_AUDIO_INPUT)
++		if (widget.type != WT_AUDIO_INPUT
++			|| hda_widget_is_redundant_adc(audioGroup, widget))
+ 			continue;
+ 
+ 		TRACE("  look at input widget %" B_PRIu32 " (%" B_PRIu32 " inputs)\n",
+@@ -1450,17 +1488,6 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
+ 			|| widget.d.io.formats == 0)
+ 			continue;
+ 
+-		// On the X270's ALC298, ADC 8 receives the external microphone and
+-		// ADC 9 receives the fixed internal microphone. Both converters would
+-		// otherwise be assigned channel 0 of the same two-channel stream.
+-		// Select the internal microphone converter for this capture path.
+-		if (stream->type == STREAM_RECORD
+-			&& audioGroup->codec->vendor_id == 0x10ec
+-			&& audioGroup->codec->product_id == 0x0298
+-			&& audioGroup->codec->subsystem_id == 0x17aa5062
+-			&& widget.node_id == 8)
+-			continue;
+-
+ 		if (count == 0) {
+ 			stream->sample_format = widget.d.io.formats;
+ 			stream->sample_rate = widget.d.io.rates;
+diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp b/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+index cadca92821..795fd7f2f2 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+@@ -274,31 +274,6 @@ set_global_format(hda_audio_group* audioGroup, multi_format_info* data)
+ }
+ 
+ 
+-static enum strind_id
+-hda_find_multi_string(hda_widget& widget)
+-{
+-	switch (CONF_DEFAULT_DEVICE(widget.d.pin.config)) {
+-		case PIN_DEV_CD:
+-			return S_CD;
+-		case PIN_DEV_LINE_IN:
+-		case PIN_DEV_LINE_OUT:
+-			return S_LINE;
+-		case PIN_DEV_MIC_IN:
+-			return S_MIC;
+-		case PIN_DEV_AUX:
+-			return S_AUX;
+-		case PIN_DEV_SPDIF_IN:
+-		case PIN_DEV_SPDIF_OUT:
+-			return S_SPDIF;
+-		case PIN_DEV_HEAD_PHONE_OUT:
+-			return S_HEADPHONE;
+-	}
+-	ERROR("couln't find a string for widget %" B_PRIu32 " in "
+-		"hda_find_multi_string()\n", widget.node_id);
+-	return S_null;
+-}
+-
+-
+ static void
+ hda_find_multi_custom_string(hda_widget& widget, char* custom, uint32 size)
+ {
+@@ -306,12 +281,15 @@ hda_find_multi_custom_string(hda_widget& widget, char* custom, uint32 size)
+ 	switch (CONF_DEFAULT_DEVICE(widget.d.pin.config)) {
+ 		case PIN_DEV_LINE_IN:
+ 			device = "Line in";
+-		case PIN_DEV_LINE_OUT:
+-			if (device == NULL)
+-				device = "Line out";
++			break;
+ 		case PIN_DEV_MIC_IN:
+-			if (device == NULL)
+-				device =  "Mic in";
++			device = "Mic in";
++			break;
++		case PIN_DEV_LINE_OUT:
++			// The colour names a line out's role on desktop boards (green
++			// front, black rear, ...). For a microphone it is only the colour:
++			// a black mic jack used to show up as "Rear".
++			device = "Line out";
+ 			switch (CONF_DEFAULT_COLOR(widget.d.pin.config)) {
+ 				case 1:
+ 					device = "Rear";
+@@ -354,13 +332,68 @@ hda_find_multi_custom_string(hda_widget& widget, char* custom, uint32 size)
+ 			"hda_find_multi_custom_string()\n", widget.node_id);
+ 	}
+ 
+-	const char* location
+-		= get_widget_location(CONF_DEFAULT_LOCATION(widget.d.pin.config));
++	if (device == NULL)
++		device = "Other";
++
++	// A built-in device (speaker, microphone array) is better told apart by
++	// being internal than by its position, which BIOSes fill in loosely.
++	const char* location = NULL;
++	if (CONF_DEFAULT_CONNECTIVITY(widget.d.pin.config) == PIN_CONN_FIXED)
++		location = "Internal";
++	else {
++		location = get_widget_location(
++			CONF_DEFAULT_LOCATION(widget.d.pin.config));
++	}
+ 	snprintf(custom, size, "%s%s%s", location ? location : "",
+ 		location ? " " : "", device);
+ }
+ 
+ 
++/*!	Whether the BIOS says nothing is wired to this pin. Such pins still appear
++	in the codec's connection lists, but a control for them only adds a
++	slider that does nothing (on a ThinkPad T470s: two extra "Speaker" and a
++	nameless one).
++*/
++static bool
++hda_pin_is_unconnected(hda_widget& widget)
++{
++	return widget.type == WT_PIN_COMPLEX
++		&& CONF_DEFAULT_CONNECTIVITY(widget.d.pin.config) == PIN_CONN_NONE;
++}
++
++
++/*!	Whether an input of a selector or mixer gets an entry in its source menu.
++	hda_create_mux_control() and the two mux_*() mappings must agree on this,
++	or a menu entry selects another connection than it names.
++*/
++static bool
++hda_mux_lists_input(hda_widget* input)
++{
++	return input != NULL && input->type == WT_PIN_COMPLEX
++		&& !hda_pin_is_unconnected(*input);
++}
++
++
++/*!	The pin an input converter records from, following the active input of
++	selectors and mixers, or NULL if there is none.
++*/
++static hda_widget*
++hda_input_source_pin(hda_audio_group* audioGroup, hda_widget& widget)
++{
++	hda_widget* current = &widget;
++	for (uint32 depth = 0; depth < 16 && current != NULL; depth++) {
++		if (current->type == WT_PIN_COMPLEX)
++			return current;
++		if (current->num_inputs == 0 || current->active_input < 0
++			|| (uint32)current->active_input >= current->num_inputs)
++			return NULL;
++		current = hda_audio_group_get_widget(audioGroup,
++			current->inputs[current->active_input]);
++	}
++	return NULL;
++}
++
++
+ static int32
+ hda_create_group_control(hda_multi *multi, uint32 *index, int32 parent,
+ 	enum strind_id string, const char* name)
+@@ -464,7 +497,7 @@ hda_create_mux_control(hda_multi *multi, uint32 *index, int32 parent,
+ 	for (uint32 j = 0; j < widget.num_inputs; j++) {
+ 		hda_widget *input =
+ 			hda_audio_group_get_widget(audioGroup, widget.inputs[j]);
+-		if (input->type != WT_PIN_COMPLEX)
++		if (!hda_mux_lists_input(input))
+ 			continue;
+ 		control.nid = widget.node_id;
+ 		control.input = true;
+@@ -549,6 +582,8 @@ hda_create_controls_list(hda_multi* multi)
+ 			continue;
+ 		if ((complex.flags & WIDGET_FLAG_OUTPUT_PATH) == 0)
+ 			continue;
++		if (hda_pin_is_unconnected(complex))
++			continue;
+ 
+ 		TRACE("create complex nid %" B_PRIu32 "\n", complex.node_id);
+ 		hda_find_multi_custom_string(complex, name, sizeof(name));
+@@ -580,6 +615,8 @@ hda_create_controls_list(hda_multi* multi)
+ 					continue;
+ 				if ((complex->flags & WIDGET_FLAG_OUTPUT_PATH) != 0)
+ 					continue;
++				if (hda_pin_is_unconnected(*complex))
++					continue;
+ 				TRACE("  create widget input nid %" B_PRIu32 "\n",
+ 					widget.inputs[j]);
+ 				hda_find_multi_custom_string(*complex, name, sizeof(name));
+@@ -605,9 +642,20 @@ hda_create_controls_list(hda_multi* multi)
+ 		uint32 capabilities = widget.capabilities.input_amplifier;
+ 		if (AMP_CAP_NUM_STEPS(capabilities) < 1)
+ 			continue;
++		// A converter the input tree found no source for records nothing.
++		if ((widget.flags & WIDGET_FLAG_INPUT_PATH) == 0)
++			continue;
+ 
++		// Name the group after what it records: three groups all called
++		// "Input" could not be told apart.
++		char name[48];
++		hda_widget* source = hda_input_source_pin(audioGroup, widget);
++		if (source != NULL)
++			hda_find_multi_custom_string(*source, name, sizeof(name));
++		else
++			strlcpy(name, "Input", sizeof(name));
+ 		parent2 = hda_create_group_control(multi, &index,
+-			parent, hda_find_multi_string(widget), "Input");
++			parent, S_null, name);
+ 		bool gain = true, mute = true;
+ 		hda_create_channel_control(multi, &index, parent2, 0,
+ 			widget, true, capabilities, 0, gain, mute);
+@@ -699,7 +747,7 @@ mux_menu_to_connection(hda_audio_group* audioGroup, uint32 nid, uint32 item)
+ 	for (uint32 j = 0; j < widget->num_inputs; j++) {
+ 		hda_widget* input = hda_audio_group_get_widget(audioGroup,
+ 			widget->inputs[j]);
+-		if (input == NULL || input->type != WT_PIN_COMPLEX)
++		if (!hda_mux_lists_input(input))
+ 			continue;
+ 		if (count++ == item)
+ 			return j;
+@@ -720,7 +768,7 @@ mux_connection_to_menu(hda_audio_group* audioGroup, uint32 nid,
+ 	for (uint32 j = 0; j < widget->num_inputs; j++) {
+ 		hda_widget* input = hda_audio_group_get_widget(audioGroup,
+ 			widget->inputs[j]);
+-		if (input == NULL || input->type != WT_PIN_COMPLEX)
++		if (!hda_mux_lists_input(input))
+ 			continue;
+ 		if (j == connection)
+ 			return count;
+-- 
+2.54.1
+

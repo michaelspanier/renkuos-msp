@@ -1,0 +1,632 @@
+From 7ed09a25bc6273f28c96b955918d6135ed17d41e Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Fri, 20 Nov 2026 22:09:25 +0000
+Subject: [PATCH 05/43] usb_webcam: assemble UVC frames from checked payload
+ headers
+
+UVCDeframer::Write() read the payload header without checking it: an
+empty packet read past its end, a header length larger than the packet
+gave a negative payload size, and the error bit was ignored, so broken
+frames were shown. When the frame ID changed without an end-of-frame
+bit, the first payload of the new frame was still added to the old one.
+When the queue was full, the new data was dropped instead of the old
+frame.
+
+The header is now parsed once in uvc_parse_payload_header() (new
+UVCPayload.h, no Haiku dependencies, so it can be tested on its own):
+too short packets and impossible header lengths are skipped. A frame
+ends with the end-of-frame bit or before the first payload with a new
+frame ID. A frame with the error bit, an empty frame and the first
+frame after the start, which usually begins in the middle, are dropped.
+When the consumer is behind, the oldest queued frame goes.
+
+With more than one isochronous transfer in flight, which larger sizes
+need, the packets can be handed over out of order. The SOF counter in
+the source clock field of the header shows that: a step back marks the
+frame as broken instead of showing it torn.
+
+UVCPayloadTest covers the header parsing, the frame checks and the SOF
+order with headers as the built-in camera of a ThinkPad T470s sends
+them.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 5f1a56a62368ef80ed14d89c376c77bd27c0d2b6)
+---
+ .../usb_webcam/addons/uvc/UVCDeframer.cpp     | 103 ++++---
+ .../usb_webcam/addons/uvc/UVCDeframer.h       |   5 +
+ .../usb_webcam/addons/uvc/UVCPayload.h        | 134 ++++++++++
+ src/tests/add-ons/media/Jamfile               |   1 +
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   4 +
+ .../media/usb_webcam/UVCPayloadTest.cpp       | 253 ++++++++++++++++++
+ 6 files changed, 470 insertions(+), 30 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCPayload.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/Jamfile
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCPayloadTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+index de84f3840c..49a6651296 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+@@ -8,19 +8,23 @@
+ 
+ #include "CamDebug.h"
+ #include "CamDevice.h"
++#include "UVCPayload.h"
+ 
+ #include <Autolock.h>
+ 
+ 
+ #define MAX_TAG_LEN CAMDEFRAMER_MAX_TAG_LEN
+-#define MAXFRAMEBUF CAMDEFRAMER_MAX_QUEUED_FRAMES
++static const int32 kMaxQueuedFrames = 2;
+ 
+ 
+ UVCDeframer::UVCDeframer(CamDevice* device)
+ 	: CamDeframer(device),
+ 	fFrameCount(0),
+-	fID(0)
++	fID(0),
++	fSynced(false),
++	fFrameBroken(false)
+ {
++	uvc_sof_order_reset(&fSOFOrder);
+ }
+ 
+ 
+@@ -33,41 +37,80 @@ ssize_t
+ UVCDeframer::Write(const void* buffer, size_t size)
+ {
+ 	const uint8* buf = (const uint8*)buffer;
+-	int payloadSize = size - buf[0]; // total length - header length
+-	
+-	// This packet is just a header
+-	if (size == buf[0])
+-		return 0;
+-	
+-	// Allocate frame
+-	if (!fCurrentFrame) {
+-		BAutolock l(fLocker);
+-		if (fFrames.CountItems() < MAXFRAMEBUF)
+-			fCurrentFrame = AllocFrame();
+-		else {
+-			printf("Dropped %ld bytes. Too many queued frames.)\n", size);
+-			return size;
+-		}
++
++	uvc_payload_header header;
++	if (!uvc_parse_payload_header(buf, size, &header))
++		return size;
++
++	// A changed frame ID means that the previous frame is complete.
++	if (header.frameID != fID) {
++		_FinishFrame();
++		fID = header.frameID;
+ 	}
+-	
+-	// Write payload to buffer
+-	fInputBuffer.Write(&buf[buf[0]], payloadSize);
+-	
+-	// If end of frame add frame to list of frames
+-	if ((buf[1] & 2) || (buf[1] & 1) != fID) {
+-		fID = buf[1] & 1;
+-		fFrameCount++;
+-		buf = (uint8*)fInputBuffer.Buffer();
+-		fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
+-		fFrames.AddItem(fCurrentFrame);
+-		release_sem(fFrameSem);
+-		fCurrentFrame = NULL;
++
++	// Swapped transfers show as a step back of the camera's SOF counter.
++	if (header.error
++		|| (header.hasSOF && !uvc_sof_in_order(&fSOFOrder, header.sof)))
++		fFrameBroken = true;
++
++	size_t payloadSize = size - header.length;
++	if (payloadSize > 0 && !fFrameBroken) {
++		fInputBuffer.WriteAt(fInputBuffer.BufferLength(), &buf[header.length],
++			payloadSize);
+ 	}
+ 
++	if (header.endOfFrame)
++		_FinishFrame();
++
+ 	return size;
+ }
+ 
+ 
++/*!	Hands the collected payloads over as one frame and starts a new one.
++	The first frame after the start is dropped, it usually begins in the middle,
++	and so is a frame the camera marked as broken.
++*/
++void
++UVCDeframer::_FinishFrame()
++{
++	size_t length = fInputBuffer.BufferLength();
++	const void* data = fInputBuffer.Buffer();
++
++	bool usable = uvc_frame_usable(length, fFrameBroken);
++	fFrameBroken = false;
++	if (!usable) {
++		fInputBuffer.SetSize(0);
++		return;
++	}
++
++	if (!fSynced) {
++		fSynced = true;
++		fInputBuffer.SetSize(0);
++		return;
++	}
++
++	BAutolock l(fLocker);
++
++	// A video stream is only useful live: when the consumer is behind, the
++	// oldest frame goes, not the new one.
++	while (fFrames.CountItems() >= kMaxQueuedFrames) {
++		delete (CamFrame*)fFrames.RemoveItem((int32)0);
++		acquire_sem_etc(fFrameSem, 1, B_RELATIVE_TIMEOUT, 0);
++	}
++
++	CamFrame* frame = AllocFrame();
++	if (frame == NULL) {
++		fInputBuffer.SetSize(0);
++		return;
++	}
++	frame->Write(data, length);
++	fFrames.AddItem(frame);
++	fFrameCount++;
++	release_sem(fFrameSem);
++	fInputBuffer.SetSize(0);
++}
++
++
+ void
+ UVCDeframer::_PrintBuffer(const void* buffer, size_t size)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+index f642bafdc7..377a9f9844 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+@@ -7,6 +7,7 @@
+ 
+ 
+ #include "CamDeframer.h"
++#include "UVCPayload.h"
+ 
+ #include <USB3.h>
+ 
+@@ -21,9 +22,13 @@ public:
+ 
+ private:
+ 	void						_PrintBuffer(const void* buffer, size_t size);
++	void						_FinishFrame();
+ 
+ 	int32						fFrameCount;
+ 	int32						fID;
++	bool						fSynced;
++	bool						fFrameBroken;
++	uvc_sof_order				fSOFOrder;
+ 	BMallocIO					fInputBuffer;
+ };
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCPayload.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCPayload.h
+new file mode 100644
+index 0000000000..6423ff97af
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCPayload.h
+@@ -0,0 +1,134 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef UVC_PAYLOAD_H
++#define UVC_PAYLOAD_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++//	Bits of the header's second byte. (UVC 1.0 § 2.4.3.3.)
++static const uint8_t kUVCFrameIDBit = 0x01;
++static const uint8_t kUVCEndOfFrameBit = 0x02;
++static const uint8_t kUVCPresentationTimeBit = 0x04;
++static const uint8_t kUVCSourceClockBit = 0x08;
++static const uint8_t kUVCErrorBit = 0x40;
++
++static const size_t kUVCMinHeaderLength = 2;
++static const size_t kUVCPresentationTimeLength = 4;
++static const size_t kUVCSourceTimeLength = 4;
++static const size_t kUVCSourceClockLength = 6;
++
++//	The SOF counter in the source clock counts USB frames (milliseconds) in
++//	11 bits.
++static const uint16_t kUVCFrameCounterMask = 0x7ff;
++static const uint16_t kUVCFrameCounterHalf = 0x400;
++
++
++struct uvc_payload_header {
++			size_t				length;
++			uint8_t				frameID;
++			bool				endOfFrame;
++			bool				error;
++			bool				hasSOF;
++			uint16_t			sof;
++};
++
++
++/*!	Reads the SOF counter of the source clock field, if the header has one
++	that fits into its length.
++*/
++static inline void
++uvc_parse_source_clock(const uint8_t* packet, uvc_payload_header* header)
++{
++	header->hasSOF = false;
++	uint8_t flags = packet[1];
++	if ((flags & kUVCSourceClockBit) == 0)
++		return;
++
++	size_t offset = kUVCMinHeaderLength;
++	if ((flags & kUVCPresentationTimeBit) != 0)
++		offset += kUVCPresentationTimeLength;
++	if (header->length < offset + kUVCSourceClockLength)
++		return;
++
++	const uint8_t* counter = packet + offset + kUVCSourceTimeLength;
++	header->sof = (counter[0] | (counter[1] << 8)) & kUVCFrameCounterMask;
++	header->hasSOF = true;
++}
++
++
++/*!	Reads the header at the start of an isochronous packet. Returns false if
++	the packet is too short to hold the header it announces; such a packet
++	comes from the device and must not be trusted.
++*/
++static inline bool
++uvc_parse_payload_header(const uint8_t* packet, size_t size,
++	uvc_payload_header* header)
++{
++	if (size < kUVCMinHeaderLength)
++		return false;
++
++	size_t length = packet[0];
++	if (length < kUVCMinHeaderLength || length > size)
++		return false;
++
++	uint8_t flags = packet[1];
++	header->length = length;
++	header->frameID = flags & kUVCFrameIDBit;
++	header->endOfFrame = (flags & kUVCEndOfFrameBit) != 0;
++	header->error = (flags & kUVCErrorBit) != 0;
++	uvc_parse_source_clock(packet, header);
++	return true;
++}
++
++
++/*!	Watches the SOF counter of the packets in the order they are handed over.
++	The counter only goes forward; a step back means that the transfers came
++	in swapped and the frame being assembled is mixed up.
++*/
++struct uvc_sof_order {
++			bool				known;
++			uint16_t			last;
++};
++
++
++static inline void
++uvc_sof_order_reset(uvc_sof_order* order)
++{
++	order->known = false;
++	order->last = 0;
++}
++
++
++/*!	Returns false if \a sof lies before the previous counter. Only the step
++	back itself is reported: the counter is taken over either way, so a stream
++	that starts anew is not held "behind".
++*/
++static inline bool
++uvc_sof_in_order(uvc_sof_order* order, uint16_t sof)
++{
++	uint16_t step = (sof - order->last) & kUVCFrameCounterMask;
++	bool inOrder = !order->known || step < kUVCFrameCounterHalf;
++	order->known = true;
++	order->last = sof;
++	return inOrder;
++}
++
++
++/*!	A frame in which the camera reported an error is incomplete; showing it
++	gives a torn or black picture.
++*/
++static inline bool
++uvc_frame_usable(size_t length, bool hadError)
++{
++	return length > 0 && !hadError;
++}
++
++
++#endif	// UVC_PAYLOAD_H
+diff --git a/src/tests/add-ons/media/Jamfile b/src/tests/add-ons/media/Jamfile
+index be7ba9cfea..8fd754f454 100644
+--- a/src/tests/add-ons/media/Jamfile
++++ b/src/tests/add-ons/media/Jamfile
+@@ -2,3 +2,4 @@ SubDir HAIKU_TOP src tests add-ons media ;
+ 
+ SubInclude HAIKU_TOP src tests add-ons media plugins ;
+ SubInclude HAIKU_TOP src tests add-ons media media-add-ons ;
++SubInclude HAIKU_TOP src tests add-ons media usb_webcam ;
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+new file mode 100644
+index 0000000000..dba4bbeae4
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -0,0 +1,4 @@
++SubDir HAIKU_TOP src tests add-ons media usb_webcam ;
++
++SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
++SimpleTest UVCPayloadTest : UVCPayloadTest.cpp ;
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCPayloadTest.cpp b/src/tests/add-ons/media/usb_webcam/UVCPayloadTest.cpp
+new file mode 100644
+index 0000000000..9774d0d747
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCPayloadTest.cpp
+@@ -0,0 +1,253 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCPayload.h"
++
++#include <stdio.h>
++#include <string.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++//	Headers as the test camera 04ca:7066 sends them: 12 bytes, flags 0x8c
++//	(frame ID 0) or 0x8d (frame ID 1), plus bit 1 for the end of a frame.
++
++
++static void
++test_header_gives_flags_and_payload()
++{
++	uint8_t packet[16] = { 12, 0x8f };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(header.length == 12);
++	CHECK(header.frameID == 1);
++	CHECK(header.endOfFrame);
++	CHECK(!header.error);
++}
++
++
++static void
++test_header_only_packet_has_no_payload()
++{
++	uint8_t packet[12] = { 12, 0x8c };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(header.length == 12);
++	CHECK(header.frameID == 0);
++	CHECK(!header.endOfFrame);
++}
++
++
++static void
++test_error_bit_is_read()
++{
++	uint8_t packet[12] = { 12, 0xcc };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(header.error);
++}
++
++
++static void
++test_empty_and_one_byte_packets_are_rejected()
++{
++	uint8_t packet[2] = { 2, 0x8c };
++	uvc_payload_header header;
++	CHECK(!uvc_parse_payload_header(packet, 0, &header));
++	CHECK(!uvc_parse_payload_header(packet, 1, &header));
++}
++
++
++static void
++test_header_longer_than_the_packet_is_rejected()
++{
++	uint8_t packet[8] = { 12, 0x8c };
++	uvc_payload_header header;
++	CHECK(!uvc_parse_payload_header(packet, sizeof(packet), &header));
++}
++
++
++static void
++test_header_shorter_than_two_bytes_is_rejected()
++{
++	uint8_t packet[8] = { 1, 0x8c };
++	uvc_payload_header header;
++	CHECK(!uvc_parse_payload_header(packet, sizeof(packet), &header));
++}
++
++
++static void
++test_frame_with_error_is_not_shown()
++{
++	CHECK(uvc_frame_usable(614400, false));
++	CHECK(!uvc_frame_usable(614400, true));
++	CHECK(!uvc_frame_usable(0, false));
++}
++
++
++//	A 12-byte header as this camera sends it: length, flags (PTS and SCR
++//	present), 4 bytes PTS, 4 bytes source clock, 2 bytes SOF counter.
++static void
++make_header_with_sof(uint8_t* packet, uint16_t sof)
++{
++	memset(packet, 0, 12);
++	packet[0] = 12;
++	packet[1] = 0x8c;
++	packet[10] = sof & 0xff;
++	packet[11] = sof >> 8;
++}
++
++
++static void
++test_scr_gives_the_sof_counter()
++{
++	uint8_t packet[16];
++	make_header_with_sof(packet, 0xf234);
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(header.hasSOF);
++	// Only 11 bits count, the rest is reserved.
++	CHECK(header.sof == 0x234);
++}
++
++
++static void
++test_scr_without_pts_follows_the_flags()
++{
++	uint8_t packet[8] = { 8, 0x88, 0, 0, 0, 0, 0x05, 0x01 };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(header.hasSOF);
++	CHECK(header.sof == 0x105);
++}
++
++
++static void
++test_header_without_scr_has_no_sof()
++{
++	uint8_t plain[2] = { 2, 0x80 };
++	uint8_t ptsOnly[6] = { 6, 0x84 };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(plain, sizeof(plain), &header));
++	CHECK(!header.hasSOF);
++	CHECK(uvc_parse_payload_header(ptsOnly, sizeof(ptsOnly), &header));
++	CHECK(!header.hasSOF);
++}
++
++
++static void
++test_header_too_short_for_its_scr_has_no_sof()
++{
++	// The camera claims PTS and SCR, but the header has room for PTS only.
++	uint8_t packet[8] = { 8, 0x8c };
++	uvc_payload_header header;
++	CHECK(uvc_parse_payload_header(packet, sizeof(packet), &header));
++	CHECK(!header.hasSOF);
++}
++
++
++static void
++test_first_packet_and_forward_steps_are_in_order()
++{
++	uvc_sof_order order;
++	uvc_sof_order_reset(&order);
++	CHECK(uvc_sof_in_order(&order, 500));
++	CHECK(uvc_sof_in_order(&order, 500));
++	CHECK(uvc_sof_in_order(&order, 503));
++}
++
++
++static void
++test_step_back_is_out_of_order()
++{
++	uvc_sof_order order;
++	uvc_sof_order_reset(&order);
++	uvc_sof_in_order(&order, 172);
++	CHECK(!uvc_sof_in_order(&order, 169));
++}
++
++
++static void
++test_counter_running_over_is_in_order()
++{
++	uvc_sof_order order;
++	uvc_sof_order_reset(&order);
++	uvc_sof_in_order(&order, 2046);
++	CHECK(uvc_sof_in_order(&order, 2047));
++	CHECK(uvc_sof_in_order(&order, 1));
++}
++
++
++static void
++test_only_the_step_back_itself_is_reported()
++{
++	// Two swapped transfers: 10..12 arrives before 7..9. One report is
++	// enough to drop the frame, and the stream must not stay "behind".
++	uvc_sof_order order;
++	uvc_sof_order_reset(&order);
++	uvc_sof_in_order(&order, 12);
++	CHECK(!uvc_sof_in_order(&order, 7));
++	CHECK(uvc_sof_in_order(&order, 9));
++	CHECK(uvc_sof_in_order(&order, 13));
++}
++
++
++static void
++test_reset_forgets_the_last_counter()
++{
++	uvc_sof_order order;
++	uvc_sof_order_reset(&order);
++	uvc_sof_in_order(&order, 1500);
++	uvc_sof_order_reset(&order);
++	CHECK(uvc_sof_in_order(&order, 10));
++}
++
++
++#define RUN(test) \
++	do { \
++		int before = sFailures; \
++		test(); \
++		sTests++; \
++		printf("%s %s\n", sFailures == before ? "ok  " : "FAIL", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_header_gives_flags_and_payload);
++	RUN(test_header_only_packet_has_no_payload);
++	RUN(test_error_bit_is_read);
++	RUN(test_empty_and_one_byte_packets_are_rejected);
++	RUN(test_header_longer_than_the_packet_is_rejected);
++	RUN(test_header_shorter_than_two_bytes_is_rejected);
++	RUN(test_frame_with_error_is_not_shown);
++	RUN(test_scr_gives_the_sof_counter);
++	RUN(test_scr_without_pts_follows_the_flags);
++	RUN(test_header_without_scr_has_no_sof);
++	RUN(test_header_too_short_for_its_scr_has_no_sof);
++	RUN(test_first_packet_and_forward_steps_are_in_order);
++	RUN(test_step_back_is_out_of_order);
++	RUN(test_counter_running_over_is_in_order);
++	RUN(test_only_the_step_back_itself_is_reported);
++	RUN(test_reset_forgets_the_last_counter);
++
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

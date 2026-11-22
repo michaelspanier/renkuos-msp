@@ -1,0 +1,561 @@
+From 4513024e313312e7265d9984b9103bba0f214f3a Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 19:55:20 +0000
+Subject: [PATCH 39/43] powerstatus: let the user choose a charge limit
+
+Add a "Charge limit" submenu to the PowerStatus menu with "Full",
+80 % and 60 %. Charging starts again 5 points below the limit. The
+choice applies to every battery whose driver supports thresholds, and
+the current one is ticked when all batteries share it. The submenu
+only appears when at least one battery supports it, today on
+ThinkPads.
+
+The choices and the tick are pure logic with host tests.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit b6eb099bbd076c429753845827f93fa3c770ad1d)
+---
+ src/apps/powerstatus/ACPIDriverInterface.cpp  |  47 ++++++++
+ src/apps/powerstatus/ACPIDriverInterface.h    |   9 ++
+ src/apps/powerstatus/ChargeLimit.cpp          |  43 +++++++
+ src/apps/powerstatus/ChargeLimit.h            |  28 +++++
+ src/apps/powerstatus/DriverInterface.cpp      |  15 +++
+ src/apps/powerstatus/DriverInterface.h        |   5 +
+ src/apps/powerstatus/Jamfile                  |   1 +
+ src/apps/powerstatus/PowerStatusView.cpp      |  88 +++++++++++++++
+ src/apps/powerstatus/PowerStatusView.h        |   5 +
+ src/tests/apps/Jamfile                        |   1 +
+ .../apps/powerstatus/ChargeLimitTest.cpp      | 106 ++++++++++++++++++
+ src/tests/apps/powerstatus/Jamfile            |   5 +
+ 12 files changed, 353 insertions(+)
+ create mode 100644 src/apps/powerstatus/ChargeLimit.cpp
+ create mode 100644 src/apps/powerstatus/ChargeLimit.h
+ create mode 100644 src/tests/apps/powerstatus/ChargeLimitTest.cpp
+ create mode 100644 src/tests/apps/powerstatus/Jamfile
+
+diff --git a/src/apps/powerstatus/ACPIDriverInterface.cpp b/src/apps/powerstatus/ACPIDriverInterface.cpp
+index e2058dc278..9cc5a67bcd 100644
+--- a/src/apps/powerstatus/ACPIDriverInterface.cpp
++++ b/src/apps/powerstatus/ACPIDriverInterface.cpp
+@@ -141,6 +141,29 @@ Battery::GetExtendedBatteryInfo(acpi_extended_battery_info* info)
+ }
+ 
+ 
++status_t
++Battery::GetChargeThresholds(acpi_battery_charge_thresholds* thresholds)
++{
++	if (ioctl(fDriverHandler, GET_BATTERY_CHARGE_THRESHOLDS, thresholds,
++			sizeof(acpi_battery_charge_thresholds)) != 0)
++		return errno;
++
++	return B_OK;
++}
++
++
++status_t
++Battery::SetChargeThresholds(const acpi_battery_charge_thresholds& thresholds)
++{
++	acpi_battery_charge_thresholds request = thresholds;
++	if (ioctl(fDriverHandler, SET_BATTERY_CHARGE_THRESHOLDS, &request,
++			sizeof(acpi_battery_charge_thresholds)) != 0)
++		return errno;
++
++	return B_OK;
++}
++
++
+ void
+ Battery::_Init()
+ {
+@@ -212,6 +235,30 @@ ACPIDriverInterface::GetBatteryCount()
+ }
+ 
+ 
++status_t
++ACPIDriverInterface::GetChargeThresholds(int32 index,
++	acpi_battery_charge_thresholds* thresholds)
++{
++	BAutolock autolock(fInterfaceLocker);
++	if (index < 0 || index >= fDriverList.CountItems())
++		return B_BAD_INDEX;
++
++	return fDriverList.ItemAt(index)->GetChargeThresholds(thresholds);
++}
++
++
++status_t
++ACPIDriverInterface::SetChargeThresholds(int32 index,
++	const acpi_battery_charge_thresholds& thresholds)
++{
++	BAutolock autolock(fInterfaceLocker);
++	if (index < 0 || index >= fDriverList.CountItems())
++		return B_BAD_INDEX;
++
++	return fDriverList.ItemAt(index)->SetChargeThresholds(thresholds);
++}
++
++
+ status_t
+ ACPIDriverInterface::_UpdateBatteryInfo()
+ {
+diff --git a/src/apps/powerstatus/ACPIDriverInterface.h b/src/apps/powerstatus/ACPIDriverInterface.h
+index 2390a65528..3be6cafaa1 100644
+--- a/src/apps/powerstatus/ACPIDriverInterface.h
++++ b/src/apps/powerstatus/ACPIDriverInterface.h
+@@ -43,6 +43,10 @@ public:
+ 	status_t 					GetBatteryInfoCached(battery_info* info);
+ 	status_t 					GetExtendedBatteryInfo(
+ 									acpi_extended_battery_info* info);
++	status_t					GetChargeThresholds(
++									acpi_battery_charge_thresholds* thresholds);
++	status_t					SetChargeThresholds(
++									const acpi_battery_charge_thresholds& thresholds);
+ 
+ private:
+ 	void						_Init();
+@@ -70,6 +74,11 @@ public:
+ 
+ 	virtual int32				GetBatteryCount();
+ 
++	virtual	status_t			GetChargeThresholds(int32 index,
++									acpi_battery_charge_thresholds* thresholds);
++	virtual	status_t			SetChargeThresholds(int32 index,
++									const acpi_battery_charge_thresholds& thresholds);
++
+ protected:
+ 	// Read the battery info from the hardware.
+ 	virtual status_t 			_UpdateBatteryInfo();
+diff --git a/src/apps/powerstatus/ChargeLimit.cpp b/src/apps/powerstatus/ChargeLimit.cpp
+new file mode 100644
+index 0000000000..dc18aefbdd
+--- /dev/null
++++ b/src/apps/powerstatus/ChargeLimit.cpp
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "ChargeLimit.h"
++
++
++// Charging starts again 5 points below the limit, so that a battery on the
++// adapter is not topped up all the time. A start of 0 leaves it to the
++// firmware.
++const charge_limit kChargeLimits[] = {
++	{ 0, 100 },
++	{ 75, 80 },
++	{ 55, 60 }
++};
++
++const int32 kChargeLimitCount = sizeof(kChargeLimits) / sizeof(kChargeLimits[0]);
++
++
++/*!	Returns the index of the choice whose stop all \a count batteries have,
++	or -1 if they differ or no choice has it.
++*/
++int32
++charge_limit_index(const uint32* stops, int32 count)
++{
++	if (count < 1)
++		return -1;
++
++	for (int32 i = 1; i < count; i++) {
++		if (stops[i] != stops[0])
++			return -1;
++	}
++
++	for (int32 i = 0; i < kChargeLimitCount; i++) {
++		if (kChargeLimits[i].stop == stops[0])
++			return i;
++	}
++	return -1;
++}
+diff --git a/src/apps/powerstatus/ChargeLimit.h b/src/apps/powerstatus/ChargeLimit.h
+new file mode 100644
+index 0000000000..acdbc6f3b2
+--- /dev/null
++++ b/src/apps/powerstatus/ChargeLimit.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef CHARGE_LIMIT_H
++#define CHARGE_LIMIT_H
++
++
++#include <SupportDefs.h>
++
++
++struct charge_limit {
++			uint32				start;
++			uint32				stop;
++};
++
++
++// The choices of the charge limit menu, from a full charge down.
++extern const charge_limit kChargeLimits[];
++extern const int32 kChargeLimitCount;
++
++
++int32	charge_limit_index(const uint32* stops, int32 count);
++
++
++#endif	// CHARGE_LIMIT_H
+diff --git a/src/apps/powerstatus/DriverInterface.cpp b/src/apps/powerstatus/DriverInterface.cpp
+index 2fab52866f..1f65f26ec8 100644
+--- a/src/apps/powerstatus/DriverInterface.cpp
++++ b/src/apps/powerstatus/DriverInterface.cpp
+@@ -147,3 +147,18 @@ PowerStatusDriverInterface::_ThreadWatchPowerFunction(void* data)
+ 	return 0;
+ }
+ 
++
++status_t
++PowerStatusDriverInterface::GetChargeThresholds(int32 index,
++	acpi_battery_charge_thresholds* thresholds)
++{
++	return B_NOT_SUPPORTED;
++}
++
++
++status_t
++PowerStatusDriverInterface::SetChargeThresholds(int32 index,
++	const acpi_battery_charge_thresholds& thresholds)
++{
++	return B_NOT_SUPPORTED;
++}
+diff --git a/src/apps/powerstatus/DriverInterface.h b/src/apps/powerstatus/DriverInterface.h
+index 683c967764..00fb2c709d 100644
+--- a/src/apps/powerstatus/DriverInterface.h
++++ b/src/apps/powerstatus/DriverInterface.h
+@@ -65,6 +65,11 @@ public:
+ 
+ 	virtual int32				GetBatteryCount() = 0;
+ 
++	virtual	status_t			GetChargeThresholds(int32 index,
++									acpi_battery_charge_thresholds* thresholds);
++	virtual	status_t			SetChargeThresholds(int32 index,
++									const acpi_battery_charge_thresholds& thresholds);
++
+ protected:
+ 	virtual void				_WatchPowerStatus() = 0;
+ 
+diff --git a/src/apps/powerstatus/Jamfile b/src/apps/powerstatus/Jamfile
+index dbaa1edbad..44199ee029 100644
+--- a/src/apps/powerstatus/Jamfile
++++ b/src/apps/powerstatus/Jamfile
+@@ -6,6 +6,7 @@ UsePrivateSystemHeaders ;
+ Application PowerStatus :
+ 	ACPIDriverInterface.cpp
+ 	APMDriverInterface.cpp
++	ChargeLimit.cpp
+ 	DriverInterface.cpp
+ 	ExtendedInfoWindow.cpp
+ 	PowerStatusWindow.cpp
+diff --git a/src/apps/powerstatus/PowerStatusView.cpp b/src/apps/powerstatus/PowerStatusView.cpp
+index 8d1e22ada4..14775591ae 100644
+--- a/src/apps/powerstatus/PowerStatusView.cpp
++++ b/src/apps/powerstatus/PowerStatusView.cpp
+@@ -13,12 +13,14 @@
+ #include "PowerStatusView.h"
+ 
+ #include <algorithm>
++#include <vector>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
+ #include <AboutWindow.h>
++#include <Alert.h>
+ #include <Application.h>
+ #include <Bitmap.h>
+ #include <Beep.h>
+@@ -43,6 +45,7 @@
+ 
+ #include "ACPIDriverInterface.h"
+ #include "APMDriverInterface.h"
++#include "ChargeLimit.h"
+ #include "ExtendedInfoWindow.h"
+ #include "PowerStatus.h"
+ 
+@@ -59,6 +62,7 @@ const uint32 kMsgToggleLabel = 'tglb';
+ const uint32 kMsgToggleTime = 'tgtm';
+ const uint32 kMsgToggleStatusIcon = 'tgsi';
+ const uint32 kMsgToggleExtInfo = 'texi';
++const uint32 kMsgSetChargeLimit = 'stcl';
+ 
+ const double kLowBatteryPercentage = 0.15;
+ const double kNoteBatteryPercentage = 0.3;
+@@ -789,6 +793,15 @@ PowerStatusReplicant::MessageReceived(BMessage *message)
+ 			_OpenExtendedWindow();
+ 			break;
+ 
++		case kMsgSetChargeLimit:
++		{
++			acpi_battery_charge_thresholds limit;
++			limit.start = message->GetUInt32("start", 0);
++			limit.stop = message->GetUInt32("stop", 100);
++			_SetChargeLimit(limit);
++			break;
++		}
++
+ 		case B_ABOUT_REQUESTED:
+ 			_AboutRequested();
+ 			break;
+@@ -831,6 +844,9 @@ PowerStatusReplicant::MouseDown(BPoint point)
+ 		menu->AddSeparatorItem();
+ 		menu->AddItem(new BMenuItem(B_TRANSLATE("Battery info" B_UTF8_ELLIPSIS),
+ 			new BMessage(kMsgToggleExtInfo)));
++		BMenu* chargeLimitMenu = _ChargeLimitMenu();
++		if (chargeLimitMenu != NULL)
++			menu->AddItem(chargeLimitMenu);
+ 
+ 		menu->AddSeparatorItem();
+ 		menu->AddItem(new BMenuItem(B_TRANSLATE("About" B_UTF8_ELLIPSIS),
+@@ -845,6 +861,78 @@ PowerStatusReplicant::MouseDown(BPoint point)
+ }
+ 
+ 
++/*!	Returns the menu to choose the charge limit of all batteries, or NULL
++	if no battery driver supports it.
++*/
++BMenu*
++PowerStatusReplicant::_ChargeLimitMenu()
++{
++	std::vector<uint32> stops;
++	for (int32 i = 0; i < fDriverInterface->GetBatteryCount(); i++) {
++		acpi_battery_charge_thresholds thresholds;
++		if (fDriverInterface->GetChargeThresholds(i, &thresholds) == B_OK)
++			stops.push_back(thresholds.stop);
++	}
++	if (stops.empty())
++		return NULL;
++
++	int32 marked = charge_limit_index(&stops[0], stops.size());
++
++	BMenu* menu = new BMenu(B_TRANSLATE("Charge limit"));
++	menu->SetFont(be_plain_font);
++
++	BNumberFormat numberFormat;
++	for (int32 i = 0; i < kChargeLimitCount; i++) {
++		BString percent;
++		if (numberFormat.FormatPercent(percent,
++				kChargeLimits[i].stop / 100.0) != B_OK) {
++			percent.SetToFormat("%" B_PRIu32 "%%", kChargeLimits[i].stop);
++		}
++
++		BString label = percent;
++		if (kChargeLimits[i].stop == 100) {
++			label = B_TRANSLATE("Full (%percent%)");
++			label.ReplaceFirst("%percent%", percent);
++		}
++
++		BMessage* message = new BMessage(kMsgSetChargeLimit);
++		message->AddUInt32("start", kChargeLimits[i].start);
++		message->AddUInt32("stop", kChargeLimits[i].stop);
++
++		BMenuItem* item = new BMenuItem(label, message);
++		item->SetMarked(i == marked);
++		menu->AddItem(item);
++	}
++	menu->SetTargetForItems(this);
++	return menu;
++}
++
++
++void
++PowerStatusReplicant::_SetChargeLimit(const acpi_battery_charge_thresholds& limit)
++{
++	status_t status = B_OK;
++	for (int32 i = 0; i < fDriverInterface->GetBatteryCount(); i++) {
++		acpi_battery_charge_thresholds current;
++		if (fDriverInterface->GetChargeThresholds(i, &current) != B_OK)
++			continue;
++
++		status_t result = fDriverInterface->SetChargeThresholds(i, limit);
++		if (result != B_OK)
++			status = result;
++	}
++	if (status == B_OK)
++		return;
++
++	BString text(B_TRANSLATE("The charge limit could not be set: %error%"));
++	text.ReplaceFirst("%error%", strerror(status));
++	BAlert* alert = new BAlert(B_TRANSLATE("Charge limit"), text,
++		B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
++	alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
++	alert->Go(NULL);
++}
++
++
+ void
+ PowerStatusReplicant::_AboutRequested()
+ {
+diff --git a/src/apps/powerstatus/PowerStatusView.h b/src/apps/powerstatus/PowerStatusView.h
+index 3086ab7d01..f6cfea8063 100644
+--- a/src/apps/powerstatus/PowerStatusView.h
++++ b/src/apps/powerstatus/PowerStatusView.h
+@@ -16,6 +16,7 @@
+ 
+ 
+ class BFile;
++class BMenu;
+ 
+ 
+ class PowerStatusView : public BView {
+@@ -96,6 +97,10 @@ private:
+ 
+ 			void			_OpenExtendedWindow();
+ 
++			BMenu*			_ChargeLimitMenu();
++			void			_SetChargeLimit(
++								const acpi_battery_charge_thresholds& limit);
++
+ private:
+ 			BWindow*		fExtendedWindow;
+ 			bool			fMessengerExist;
+diff --git a/src/tests/apps/Jamfile b/src/tests/apps/Jamfile
+index ab2fce495e..f95cec19fc 100644
+--- a/src/tests/apps/Jamfile
++++ b/src/tests/apps/Jamfile
+@@ -8,4 +8,5 @@ SubInclude HAIKU_TOP src tests apps installer ;
+ SubInclude HAIKU_TOP src tests apps mediaplayer ;
+ SubInclude HAIKU_TOP src tests apps miniterminal ;
+ SubInclude HAIKU_TOP src tests apps partitioner ;
++SubInclude HAIKU_TOP src tests apps powerstatus ;
+ SubInclude HAIKU_TOP src tests apps terminal_replicant ;
+diff --git a/src/tests/apps/powerstatus/ChargeLimitTest.cpp b/src/tests/apps/powerstatus/ChargeLimitTest.cpp
+new file mode 100644
+index 0000000000..5ad37b8a12
+--- /dev/null
++++ b/src/tests/apps/powerstatus/ChargeLimitTest.cpp
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "ChargeLimit.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_choices_start_5_points_below_the_stop()
++{
++	CHECK(kChargeLimitCount == 3);
++	CHECK(kChargeLimits[0].stop == 100);
++	CHECK(kChargeLimits[0].start == 0);
++	CHECK(kChargeLimits[1].stop == 80);
++	CHECK(kChargeLimits[1].start == 75);
++	CHECK(kChargeLimits[2].stop == 60);
++	CHECK(kChargeLimits[2].start == 55);
++}
++
++
++static void
++test_choice_is_found_by_its_stop()
++{
++	uint32 stop = 80;
++	CHECK(charge_limit_index(&stop, 1) == 1);
++	stop = 100;
++	CHECK(charge_limit_index(&stop, 1) == 0);
++	stop = 60;
++	CHECK(charge_limit_index(&stop, 1) == 2);
++}
++
++
++static void
++test_other_stop_marks_no_choice()
++{
++	uint32 stop = 90;
++	CHECK(charge_limit_index(&stop, 1) == -1);
++	stop = 0;
++	CHECK(charge_limit_index(&stop, 1) == -1);
++}
++
++
++static void
++test_batteries_with_the_same_stop_mark_it()
++{
++	uint32 stops[] = { 80, 80 };
++	CHECK(charge_limit_index(stops, 2) == 1);
++}
++
++
++static void
++test_batteries_with_different_stops_mark_nothing()
++{
++	// A tick would claim that the choice applies to every battery.
++	uint32 stops[] = { 80, 100 };
++	CHECK(charge_limit_index(stops, 2) == -1);
++}
++
++
++static void
++test_no_battery_marks_nothing()
++{
++	CHECK(charge_limit_index(NULL, 0) == -1);
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_choices_start_5_points_below_the_stop);
++	RUN(test_choice_is_found_by_its_stop);
++	RUN(test_other_stop_marks_no_choice);
++	RUN(test_batteries_with_the_same_stop_mark_it);
++	RUN(test_batteries_with_different_stops_mark_nothing);
++	RUN(test_no_battery_marks_nothing);
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/apps/powerstatus/Jamfile b/src/tests/apps/powerstatus/Jamfile
+new file mode 100644
+index 0000000000..2ddad60bc5
+--- /dev/null
++++ b/src/tests/apps/powerstatus/Jamfile
+@@ -0,0 +1,5 @@
++SubDir HAIKU_TOP src tests apps powerstatus ;
++
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src apps powerstatus ] ;
++
++SimpleTest ChargeLimitTest : ChargeLimitTest.cpp ChargeLimit.cpp ;
+-- 
+2.54.1
+

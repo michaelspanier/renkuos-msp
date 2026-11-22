@@ -1,0 +1,258 @@
+From 7562fe01dfcbdd276b67806adfa2da99b52b0e92 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 17:01:15 +0000
+Subject: [PATCH 29/43] net80211: roam only to a clearly stronger AP
+
+In a mesh with several APs of similar strength the station switched
+back and forth: a background scan started whenever a single frame was
+below the RSSI threshold, and it switched to any AP above the
+threshold, even a weaker one.
+
+Worse, in STA mode every received frame is accounted to ic_bss, also
+the beacons of other APs seen during a background scan. These
+overwrote the RSSI of the current AP with the values of its
+neighbours.
+
+On Haiku, use the roaming logic instead:
+
+- update the RSSI of ic_bss only from frames sent by its BSSID, and
+  feed them into a smoothed value kept in the node;
+- start background scans from that value, with backoff;
+- after a scan, switch only if the logic agrees.
+
+The OpenBSD code paths stay as they are for other platforms.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ .../openbsd_wlan/net80211/ieee80211_input.c   |  18 +++
+ .../openbsd_wlan/net80211/ieee80211_node.c    | 115 ++++++++++++++++++
+ .../openbsd_wlan/net80211/ieee80211_node.h    |   8 ++
+ .../openbsd_wlan/net80211/ieee80211_var.h     |   1 +
+ 4 files changed, 142 insertions(+)
+
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_input.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_input.c
+index c436c3ac93..0d2ca2b705 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_input.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_input.c
+@@ -424,6 +424,23 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
+ 		*orxseq = nrxseq;
+ 	}
+ 	if (ic->ic_state > IEEE80211_S_SCAN) {
++#ifdef __HAIKU__
++		/*
++		 * In STA mode every frame comes with ic_bss, also the beacons
++		 * of other APs during a background scan. Only those of our
++		 * AP tell its signal.
++		 */
++		int ownap = ic->ic_opmode != IEEE80211_M_STA ||
++		    IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_bssid);
++
++		if (ownap && rxi->rxi_rssi != 0)
++			ni->ni_rssi = rxi->rxi_rssi;
++		ni->ni_rstamp = rxi->rxi_tstamp;
++		ni->ni_inact = 0;
++
++		if (ownap && ic->ic_opmode == IEEE80211_M_STA)
++			ieee80211_roam_input(ic, ni, rxi->rxi_rssi);
++#else
+ 		/* Only update RSSI if driver provided a valid value. */
+ 		if (rxi->rxi_rssi != 0)
+ 			ni->ni_rssi = rxi->rxi_rssi;
+@@ -440,6 +457,7 @@ ieee80211_inputm(struct ifnet *ifp, struct mbuf *m, struct ieee80211_node *ni,
+ 				timeout_add_msec(&ic->ic_bgscan_timeout,
+ 				    500 * (ic->ic_bgscan_fail + 1));
+ 		}
++#endif
+ 	}
+ 
+ #ifndef IEEE80211_STA_ONLY
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+index 78dcc08497..a5d521357d 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+@@ -1327,6 +1327,113 @@ ieee80211_node_switch_bss(struct ieee80211com *ic, struct ieee80211_node *ni)
+ 	ieee80211_node_join_bss(ic, selbs);
+ }
+ 
++#ifdef __HAIKU__
++/*
++ * Roaming within the ESS (see ieee80211_roam_logic.h): background scans
++ * and switches depend on the smoothed signal of the current AP instead
++ * of the last frame's, and a new AP must be clearly stronger.
++ */
++#define IEEE80211_ROAM_LOST_RATIO	20	/* in percent */
++#define IEEE80211_ROAM_LOST		(-85)	/* in dBm */
++#define IEEE80211_ROAM_HYSTERESIS	8	/* about dB */
++#define IEEE80211_ROAM_DWELL		30000	/* msec */
++#define IEEE80211_ROAM_SCAN_MIN		5000	/* msec */
++#define IEEE80211_ROAM_SCAN_MAX		60000	/* msec */
++
++static long long
++ieee80211_roam_now(void)
++{
++	return system_time() / 1000;
++}
++
++static void
++ieee80211_roam_params(struct ieee80211com *ic,
++    const struct ieee80211_node *ni, struct ieee80211_roam_params *rp)
++{
++	int is2ghz = ni->ni_chan != IEEE80211_CHAN_ANYC &&
++	    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
++
++	if (ic->ic_max_rssi) {
++		rp->rp_scan_thres = ic->ic_max_rssi * (is2ghz ?
++		    IEEE80211_RSSI_THRES_RATIO_2GHZ :
++		    IEEE80211_RSSI_THRES_RATIO_5GHZ) / 100;
++		rp->rp_lost_thres = ic->ic_max_rssi *
++		    IEEE80211_ROAM_LOST_RATIO / 100;
++	} else {
++		rp->rp_scan_thres = (u_int8_t)(is2ghz ?
++		    IEEE80211_RSSI_THRES_2GHZ : IEEE80211_RSSI_THRES_5GHZ);
++		rp->rp_lost_thres = (u_int8_t)IEEE80211_ROAM_LOST;
++	}
++	rp->rp_hysteresis = IEEE80211_ROAM_HYSTERESIS;
++	rp->rp_dwell = IEEE80211_ROAM_DWELL;
++	rp->rp_scan_min = IEEE80211_ROAM_SCAN_MIN;
++	rp->rp_scan_max = IEEE80211_ROAM_SCAN_MAX;
++}
++
++/* A frame from our AP: smooth its signal and maybe start a bgscan. */
++void
++ieee80211_roam_input(struct ieee80211com *ic, struct ieee80211_node *ni,
++    int rssi)
++{
++	struct ieee80211_roam_params rp;
++	long long now = ieee80211_roam_now();
++
++	if (rssi != 0)
++		ieee80211_roam_avg_add(&ni->ni_roam_avg, rssi, now);
++
++	if (ni != ic->ic_bss || ic->ic_state != IEEE80211_S_RUN ||
++	    ic->ic_bgscan_start == NULL ||
++	    timeout_pending(&ic->ic_bgscan_timeout) ||
++	    (ic->ic_flags & IEEE80211_F_BGSCAN) ||
++	    (ic->ic_flags & IEEE80211_F_DESBSSID))
++		return;
++
++	ieee80211_roam_params(ic, ni, &rp);
++	if (ieee80211_roam_should_scan(&rp, &ic->ic_roam,
++	    ieee80211_roam_avg_get(&ni->ni_roam_avg), now))
++		timeout_add_msec(&ic->ic_bgscan_timeout, 10);
++}
++
++/* After a bgscan: is selbs worth leaving the current AP for? */
++static int
++ieee80211_roam_switch(struct ieee80211com *ic, struct ieee80211_node *curbs,
++    struct ieee80211_node *selbs)
++{
++	struct ieee80211_roam_params rp;
++	struct ieee80211_node *ni = ic->ic_bss;
++	const u_int8_t *a = selbs->ni_macaddr;
++	unsigned int id = 0;
++	int cur, cand = 0;
++
++	cur = ieee80211_roam_avg_get(&ni->ni_roam_avg);
++	if (cur == 0)
++		cur = curbs->ni_rssi;
++	if (selbs != curbs) {
++		cand = selbs->ni_rssi;
++		id = (unsigned int)a[2] << 24 | a[3] << 16 | a[4] << 8 | a[5];
++		if (id == 0)
++			id = 1;
++	}
++
++	ieee80211_roam_params(ic, ni, &rp);
++	if (ieee80211_roam_should_switch(&rp, &ic->ic_roam, cur, cand, id,
++	    ieee80211_roam_now()))
++		return 1;
++	ieee80211_roam_scan_done(&rp, &ic->ic_roam);
++	return 0;
++}
++
++static void
++ieee80211_roam_join(struct ieee80211com *ic)
++{
++	struct ieee80211_roam_params rp;
++
++	memset(&ic->ic_bss->ni_roam_avg, 0, sizeof(ic->ic_bss->ni_roam_avg));
++	ieee80211_roam_params(ic, ic->ic_bss, &rp);
++	ieee80211_roam_joined(&rp, &ic->ic_roam, ieee80211_roam_now());
++}
++#endif
++
+ void
+ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs)
+ {
+@@ -1380,6 +1487,10 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs)
+ 		    ic->ic_state == IEEE80211_S_AUTH);
+ 		int mgt = -1;
+ 
++#ifdef __HAIKU__
++		if (ic->ic_opmode == IEEE80211_M_STA)
++			ieee80211_roam_join(ic);
++#endif
+ 		timeout_del(&ic->ic_bgscan_timeout);
+ 		ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+ 
+@@ -1574,7 +1685,11 @@ ieee80211_end_scan(struct ifnet *ifp)
+ 		 * Do not change ic->ic_bss in these cases and make
+ 		 * background scans less frequent.
+ 		 */
++#ifdef __HAIKU__
++		if (!ieee80211_roam_switch(ic, curbs, selbs)) {
++#else
+ 		if (selbs == curbs || !(*ic->ic_node_checkrssi)(ic, selbs)) {
++#endif
+ 			if (ic->ic_bgscan_fail < IEEE80211_BGSCAN_FAIL_MAX) {
+ 				if (ic->ic_bgscan_fail <= 0)
+ 					ic->ic_bgscan_fail = 1;
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
+index 78aa226746..70c5cb8cff 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
+@@ -34,6 +34,9 @@
+ #define _NET80211_IEEE80211_NODE_H_
+ 
+ #include <sys/tree.h>
++#ifdef __HAIKU__
++#include <net80211/ieee80211_roam_logic.h>
++#endif
+ 
+ #define	IEEE80211_PSCAN_WAIT	5		/* passive scan wait */
+ #define	IEEE80211_TRANS_WAIT	5		/* transition wait */
+@@ -276,6 +279,9 @@ struct ieee80211_node {
+ 	/* hardware */
+ 	u_int32_t		ni_rstamp;	/* recv timestamp */
+ 	u_int8_t		ni_rssi;	/* recv ssi */
++#ifdef __HAIKU__
++	struct ieee80211_roam_avg ni_roam_avg;	/* smoothed ni_rssi */
++#endif
+ 
+ 	/* header */
+ 	u_int8_t		ni_macaddr[IEEE80211_ADDR_LEN];
+@@ -614,6 +620,8 @@ void ieee80211_end_scan(struct ifnet *);
+ void ieee80211_reset_scan(struct ifnet *);
+ #ifdef __HAIKU__
+ void ieee80211_notify_scan_done(struct ieee80211com *);
++void ieee80211_roam_input(struct ieee80211com *, struct ieee80211_node *,
++		int);
+ #endif
+ struct ieee80211_node *ieee80211_alloc_node(struct ieee80211com *,
+ 		const u_int8_t *);
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h b/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
+index 939b4f4a8a..5283000a2a 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
+@@ -281,6 +281,7 @@ struct ieee80211com {
+ 	uint32_t		ic_bgscan_fail;
+ #ifdef __HAIKU__
+ 	bigtime_t		ic_last_raise_inact;
++	struct ieee80211_roam_state ic_roam;
+ 	struct timeout		ic_slowtimo;	/* drives if_watchdog */
+ #endif
+ 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
+-- 
+2.54.1
+

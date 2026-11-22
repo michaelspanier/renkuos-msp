@@ -1,0 +1,605 @@
+From 9ec770ee1871ffe64dc52fc9f95531882029ba45 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:27:43 +0000
+Subject: [PATCH 13/43] usb_webcam: decode MJPEG from UVC cameras
+
+Uncompressed video over USB 2.0 is slow at large sizes: the C920
+sends 1920x1080 at 5 fps as YUY2, but at 30 fps as MJPEG.
+
+UVCCamDevice now keeps the uncompressed and the MJPEG format, offers
+the sizes of both through UVCFrameList, probes with the format and
+frame index of the chosen size and decodes each frame by its format.
+Format and frame descriptors are only read as far as they are long,
+and the BLists of frame descriptors, which were never freed, are
+gone. A start fails if the decoder got no memory.
+
+VideoSizeAt() returns a cam_video_size, and the size label names the
+format: "1920 x 1080 (30 fps, MJPEG)".
+
+With a Logitech C920 (046d:08e5) on a ThinkPad T470s, 1920x1080 now
+runs at 29.8 fps instead of 5; decoding takes a quarter of one core.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 6b09bb43eebf284aa2b41dd4982f23dfad9042c4)
+---
+ .../media-add-ons/usb_webcam/CamDevice.cpp    |   3 +-
+ .../media-add-ons/usb_webcam/CamDevice.h      |   5 +-
+ .../media-add-ons/usb_webcam/CamVideoSize.h   |  35 +++-
+ .../media/media-add-ons/usb_webcam/Jamfile    |   8 +-
+ .../media-add-ons/usb_webcam/Producer.cpp     |  16 +-
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 176 ++++++++++++------
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  25 ++-
+ .../media/usb_webcam/CamVideoSizeTest.cpp     |  36 +++-
+ 8 files changed, 209 insertions(+), 95 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 0d5e8fea68..9f50a1a2dc 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -227,8 +227,7 @@ CamDevice::CountVideoSizes() const
+ 	frame interval in 100 ns (0 if unknown).
+ */
+ bool
+-CamDevice::VideoSizeAt(int32 index, uint32 &width, uint32 &height,
+-	uint32 &interval) const
++CamDevice::VideoSizeAt(int32 index, cam_video_size& size) const
+ {
+ 	return false;
+ }
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index daf9421ff8..372e22e5ae 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -6,6 +6,7 @@
+ #define _CAM_DEVICE_H
+ 
+ 
++#include "CamVideoSize.h"
+ #include <OS.h>
+ #include <image.h>
+ #ifdef __HAIKU__
+@@ -66,8 +67,8 @@ class CamDevice {
+ 	virtual status_t	SuggestVideoFrame(uint32 &width, uint32 &height);
+ 	virtual status_t	AcceptVideoFrame(uint32 &width, uint32 &height);
+ 	virtual int32		CountVideoSizes() const;
+-	virtual bool		VideoSizeAt(int32 index, uint32 &width, uint32 &height,
+-							uint32 &interval) const;
++	virtual bool		VideoSizeAt(int32 index,
++							cam_video_size& size) const;
+ 	virtual status_t	SetVideoFrame(BRect rect);
+ 	virtual BRect		VideoFrame() const { return fVideoFrame; };
+ 	virtual status_t	SetScale(float scale);
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h b/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
+index 792c4b3804..d05a37a0b5 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamVideoSize.h
+@@ -71,19 +71,34 @@ cam_frames_per_second(uint32_t interval)
+ }
+ 
+ 
+-//!	Writes "1920 × 1080 (5 fps)", or without the rate if it is unknown.
++struct cam_video_size {
++			uint32_t			width;
++			uint32_t			height;
++			uint32_t			interval;
++				// 100 ns units, 0 if unknown
++			const char*			format;
++				// how the camera sends it, NULL if it does not matter
++};
++
++
++//!	Writes "1920 × 1080 (30 fps, MJPEG)", leaving out what is unknown.
+ static inline void
+-cam_size_label(char* buffer, size_t size, uint32_t width, uint32_t height,
+-	uint32_t interval)
++cam_size_label(char* buffer, size_t bufferSize, const cam_video_size& size)
+ {
+-	uint32_t rate = cam_frames_per_second(interval);
+-	if (rate == 0) {
+-		snprintf(buffer, size, "%u \xc3\x97 %u", (unsigned)width,
+-			(unsigned)height);
++	int length = snprintf(buffer, bufferSize, "%u \xc3\x97 %u",
++		(unsigned)size.width, (unsigned)size.height);
++	if (length < 0 || (size_t)length >= bufferSize)
+ 		return;
+-	}
+-	snprintf(buffer, size, "%u \xc3\x97 %u (%u fps)", (unsigned)width,
+-		(unsigned)height, (unsigned)rate);
++
++	uint32_t rate = cam_frames_per_second(size.interval);
++	char* end = buffer + length;
++	size_t left = bufferSize - length;
++	if (rate != 0 && size.format != NULL)
++		snprintf(end, left, " (%u fps, %s)", (unsigned)rate, size.format);
++	else if (rate != 0)
++		snprintf(end, left, " (%u fps)", (unsigned)rate);
++	else if (size.format != NULL)
++		snprintf(end, left, " (%s)", size.format);
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 6cfc85bbf3..482518cfaa 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -73,6 +73,7 @@ actions USBWebcamHeaderGen1
+ local architectureObject ;
+ for architectureObject in [ MultiArchSubDirSetup ] {
+ 	on $(architectureObject) {
++		UseBuildFeatureHeaders jpeg ;
+ 
+ 		USBWebcamHeaderGen CamInternalAddons.h : B_WEBCAM_MKINTFUNC
+ 			: $(addonSources) ;
+@@ -101,8 +102,13 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 			CamRoster.cpp
+ 			CamSensor.cpp
+ 			CamStreamingDeframer.cpp
+-			: be media $(usbKitLibraryName) [ TargetLibsupc++ ]
++			UVCJpegDecoder.cpp
++			: be media $(usbKitLibraryName) [ BuildFeatureAttribute jpeg : library ]
++			[ TargetLibsupc++ ]
+ 		;
++
++		Includes [ FGristFiles UVCJpegDecoder.cpp ]
++			: [ BuildFeatureAttribute jpeg : headers ] ;
+ 	}
+ }
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index ec261b5b1b..e0126de007 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -816,12 +816,12 @@ VideoProducer::_AddResolutionParameter(BParameterGroup* group)
+ 		->MakeDiscreteParameter(P_RESOLUTION, B_MEDIA_RAW_VIDEO, "Resolution",
+ 			B_RESOLUTION);
+ 	for (int32 i = 0; i < fCamDevice->CountVideoSizes(); i++) {
+-		uint32 width, height, interval;
+-		if (!fCamDevice->VideoSizeAt(i, width, height, interval))
++		cam_video_size size;
++		if (!fCamDevice->VideoSizeAt(i, size))
+ 			continue;
+-		char label[48];
+-		cam_size_label(label, sizeof(label), width, height, interval);
+-		sizes->AddItem(cam_size_to_parameter(width, height), label);
++		char label[64];
++		cam_size_label(label, sizeof(label), size);
++		sizes->AddItem(cam_size_to_parameter(size.width, size.height), label);
+ 	}
+ }
+ 
+@@ -830,9 +830,9 @@ bool
+ VideoProducer::_HasVideoSize(uint32 width, uint32 height) const
+ {
+ 	for (int32 i = 0; i < fCamDevice->CountVideoSizes(); i++) {
+-		uint32 w, h, interval;
+-		if (fCamDevice->VideoSizeAt(i, w, h, interval) && w == width
+-			&& h == height) {
++		cam_video_size size;
++		if (fCamDevice->VideoSizeAt(i, size) && size.width == width
++			&& size.height == height) {
+ 			return true;
+ 		}
+ 	}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 8275f38d2b..37f371d88b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -52,6 +52,20 @@ usbvc_guid kYUY2Guid = {0x59, 0x55, 0x59, 0x32, 0x00, 0x00, 0x10, 0x00, 0x80,
+ usbvc_guid kNV12Guid = {0x4e, 0x56, 0x31, 0x32, 0x00, 0x00, 0x10, 0x00, 0x80,
+ 	0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+ 
++// The formats whose frames the device can show.
++enum {
++	kFormatNone = 0,
++	kFormatYUY2,
++	kFormatMJPEG
++};
++
++// A frame descriptor up to and including bFrameIntervalType.
++static const size_t kFrameDescriptorLength = 26;
++static const size_t kContinuousIntervalsLength = 12;
++static const size_t kUncompressedFormatLength = 27;
++static const size_t kMJPEGFormatLength = 11;
++
++
+ static void
+ print_guid(const usbvc_guid guid)
+ {
+@@ -72,9 +86,11 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	: CamDevice(_addon, _device),
+ 	fHeaderDescriptor(NULL),
+ 	fInterruptIn(NULL),
+-	fUncompressedFormatIndex(1),
+-	fUncompressedFrameIndex(1)
++	fParsedFormatIndex(0),
++	fParsedFormat(kFormatNone)
+ {
++	uvc_frame_list_init(&fFrames);
++	memset(&fFrame, 0, sizeof(fFrame));
+ 	fControlRequestIndex = 0;
+ 	fCameraRequestIndex = 0;
+ 	fCameraControls = 0;
+@@ -215,7 +231,13 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 		{
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+-			fUncompressedFormatIndex = descriptor->formatIndex;
++			if (len < kUncompressedFormatLength) {
++				fParsedFormat = kFormatNone;
++				break;
++			}
++			fParsedFormatIndex = descriptor->formatIndex;
++			fParsedFormat = memcmp(descriptor->uncompressed.format, kYUY2Guid,
++				sizeof(usbvc_guid)) == 0 ? kFormatYUY2 : kFormatNone;
+ 			printf("VS_FORMAT_UNCOMPRESSED:\tbFormatIdx=%d,#frmdesc=%d,guid=",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			print_guid(descriptor->uncompressed.format);
+@@ -247,14 +269,13 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 		{
+ 			const usb_video_frame_descriptor* descriptor
+ 				= (const usb_video_frame_descriptor*)_descriptor;
+-			if (_descriptor->descriptorSubtype == USB_VIDEO_VS_FRAME_UNCOMPRESSED) {
+-				printf("VS_FRAME_UNCOMPRESSED:");
+-				fUncompressedFrames.AddItem(
+-					new usb_video_frame_descriptor(*descriptor));
+-			} else {
+-				printf("VS_FRAME_MJPEG:");
+-				fMJPEGFrames.AddItem(new usb_video_frame_descriptor(*descriptor));
+-			}
++			if (len < kFrameDescriptorLength)
++				break;
++			const bool compressed
++				= _descriptor->descriptorSubtype == USB_VIDEO_VS_FRAME_MJPEG;
++			printf("%s", compressed ? "VS_FRAME_MJPEG:" : "VS_FRAME_UNCOMPRESSED:");
++			if (fParsedFormat == (compressed ? kFormatMJPEG : kFormatYUY2))
++				_AddFrame(*descriptor, compressed);
+ 			printf("\tbFrameIdx=%d,stillsupported=%s,"
+ 				"fixedframerate=%s\n", descriptor->frame_index,
+ 				(descriptor->capabilities & 1) ? "yes" : "no",
+@@ -265,12 +286,15 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 				descriptor->max_video_frame_buffer_size);
+ 			printf("\tdefault frame interval: %" B_PRIu32 ", #intervals(0=cont): %d\n",
+ 				descriptor->default_frame_interval, descriptor->frame_interval_type);
+-			if (descriptor->frame_interval_type == 0) {
++			if (descriptor->frame_interval_type == 0
++				&& len >= kFrameDescriptorLength + kContinuousIntervalsLength) {
+ 				printf("min/max frame interval=%" B_PRIu32 "/%" B_PRIu32 ", step=%" B_PRIu32 "\n",
+ 					descriptor->continuous.min_frame_interval,
+ 					descriptor->continuous.max_frame_interval,
+ 					descriptor->continuous.frame_interval_step);
+-			} else for (uint8 i = 0; i < descriptor->frame_interval_type; i++) {
++			} else for (uint8 i = 0; i < descriptor->frame_interval_type
++				&& kFrameDescriptorLength + (i + 1) * sizeof(uint32) <= len;
++				i++) {
+ 				printf("\tdiscrete frame interval: %" B_PRIu32 "\n",
+ 					descriptor->discrete_frame_intervals[i]);
+ 			}
+@@ -360,7 +384,12 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 		{
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+-			fMJPEGFormatIndex = descriptor->formatIndex;
++			if (len < kMJPEGFormatLength) {
++				fParsedFormat = kFormatNone;
++				break;
++			}
++			fParsedFormatIndex = descriptor->formatIndex;
++			fParsedFormat = kFormatMJPEG;
+ 			printf("VS_FORMAT_MJPEG:\tbFormatIdx=%d,#frmdesc=%d\n",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			printf("\t#flgs=%d,optfrmidx=%d,aspRX=%d,aspRY=%d\n",
+@@ -581,6 +610,8 @@ UVCCamDevice::SupportsIsochronous()
+ status_t
+ UVCCamDevice::StartTransfer()
+ {
++	if (fFrame.compressed && !fJpegDecoder.InitCheck())
++		return B_NO_MEMORY;
+ 	if (_ProbeCommitFormat() != B_OK)
+ 		return B_ERROR;
+ 	status_t status = _ResetDeframer();
+@@ -613,14 +644,14 @@ UVCCamDevice::SuggestVideoFrame(uint32& width, uint32& height)
+ 	printf("UVCCamDevice::SuggestVideoFrame(%" B_PRIu32 ", %" B_PRIu32 ")\n", width, height);
+ 	// 640x480 is a size every UVC camera offers and 30 frames per second fit
+ 	// the bandwidth of a high speed endpoint. If the camera does not have it,
+-	// take the first size it advertises.
++	// take the smallest size it offers.
+ 	width = 640;
+ 	height = 480;
+ 	if (AcceptVideoFrame(width, height) != B_OK) {
+-		const usb_video_frame_descriptor* descriptor
+-			= (const usb_video_frame_descriptor*)fUncompressedFrames.FirstItem();
+-		width  = (*descriptor).width;
+-		height = (*descriptor).height;
++		if (fFrames.count == 0)
++			return B_ERROR;
++		width = fFrames.frames[0].width;
++		height = fFrames.frames[0].height;
+ 	}
+ 	return B_OK;
+ }
+@@ -646,16 +677,11 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ 		height = 480;
+ 	}
+ 
+-	for (int i = 0; i<fUncompressedFrames.CountItems(); i++) {
+-		const usb_video_frame_descriptor* descriptor
+-			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+-		if ((*descriptor).width == width && (*descriptor).height == height) {
+-			// The probe request wants the descriptor's own frame index, which
+-			// starts at 1, not the position in our list.
+-			fUncompressedFrameIndex = descriptor->frame_index;
+-			SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+-			return B_OK;
+-		}
++	const uvc_frame* frame = uvc_frame_list_find(&fFrames, width, height);
++	if (frame != NULL) {
++		fFrame = *frame;
++		SetVideoFrame(BRect(0, 0, width - 1, height - 1));
++		return B_OK;
+ 	}
+ 
+ 	fprintf(stderr, "UVCCamDevice::AcceptVideoFrame() Invalid frame dimensions"
+@@ -667,22 +693,21 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ int32
+ UVCCamDevice::CountVideoSizes() const
+ {
+-	return fUncompressedFrames.CountItems();
++	return fFrames.count;
+ }
+ 
+ 
+ bool
+-UVCCamDevice::VideoSizeAt(int32 index, uint32& width, uint32& height,
+-	uint32& interval) const
++UVCCamDevice::VideoSizeAt(int32 index, cam_video_size& size) const
+ {
+-	const usb_video_frame_descriptor* descriptor
+-		= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(index);
+-	if (descriptor == NULL)
++	if (index < 0 || index >= fFrames.count)
+ 		return false;
+ 
+-	width = descriptor->width;
+-	height = descriptor->height;
+-	interval = descriptor->default_frame_interval;
++	const uvc_frame& frame = fFrames.frames[index];
++	size.width = frame.width;
++	size.height = frame.height;
++	size.interval = frame.interval;
++	size.format = frame.compressed ? "MJPEG" : "uncompressed";
+ 	return true;
+ }
+ 
+@@ -726,8 +751,8 @@ UVCCamDevice::_ProbeCommitFormat()
+ 	memset(&request, 0, sizeof(request));
+ 	request._hint.frame_interval = 1;
+ 	request.frame_interval = _DefaultFrameInterval();
+-	request.format_index = fUncompressedFormatIndex;
+-	request.frame_index = fUncompressedFrameIndex;
++	request.format_index = fFrame.formatIndex;
++	request.frame_index = fFrame.frameIndex;
+ 	size_t length = fHeaderDescriptor->version > 0x100 ? 34 : 26;
+ 	size_t actualLength = fDevice->ControlTransfer(
+ 		USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR,
+@@ -857,13 +882,7 @@ uint32
+ UVCCamDevice::_DefaultFrameInterval() const
+ {
+ 	const uint32 kThirtyFramesPerSecond = 333333;
+-	for (int32 i = 0; i < fUncompressedFrames.CountItems(); i++) {
+-		const usb_video_frame_descriptor* descriptor
+-			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+-		if (descriptor->frame_index == fUncompressedFrameIndex)
+-			return descriptor->default_frame_interval;
+-	}
+-	return kThirtyFramesPerSecond;
++	return fFrame.interval != 0 ? fFrame.interval : kThirtyFramesPerSecond;
+ }
+ 
+ 
+@@ -1377,26 +1396,59 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 		return err;
+ 	}
+ 
+-	int32 width = VideoFrame().IntegerWidth() + 1;
+-	int32 height = VideoFrame().IntegerHeight() + 1;
+-
+-	// A frame that is shorter than the format promises was damaged on the way.
+-	// It is not shown at all; an empty buffer would flash black.
+-	err = B_BAD_DATA;
+-	if (uvc_yuy2_frame_fits(f->BufferLength(), buffer->SizeAvailable(),
+-			width, height)) {
+-		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
+-		// applications.  This could be leveraged if applications can
+-		// consume B_YUV422.
+-		uvc_decode_yuy2((uint8*)buffer->Data(), (const uint8*)f->Buffer(),
+-			width, height);
+-		err = B_OK;
+-	}
++	uvc_picture picture;
++	picture.bits = (uint8*)buffer->Data();
++	picture.size = buffer->SizeAvailable();
++	picture.width = VideoFrame().IntegerWidth() + 1;
++	picture.height = VideoFrame().IntegerHeight() + 1;
++	err = _Decode(*f, picture);
+ 	delete f;
+ 	return err;
+ }
+ 
+ 
++/*!	Converts a frame into the B_RGB32 picture. A damaged frame, one that is
++	shorter than its format promises or that does not decode, is not shown at
++	all; an empty buffer would flash black.
++*/
++status_t
++UVCCamDevice::_Decode(const CamFrame& frame, const uvc_picture& picture)
++{
++	const uint8* data = (const uint8*)frame.Buffer();
++	if (fFrame.compressed) {
++		return fJpegDecoder.Decode(data, frame.BufferLength(), picture)
++			? B_OK : B_BAD_DATA;
++	}
++
++	if (!uvc_yuy2_frame_fits(frame.BufferLength(), picture.size,
++			picture.width, picture.height)) {
++		return B_BAD_DATA;
++	}
++	// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
++	// applications.  This could be leveraged if applications can
++	// consume B_YUV422.
++	uvc_decode_yuy2(picture.bits, data, picture.width, picture.height);
++	return B_OK;
++}
++
++
++void
++UVCCamDevice::_AddFrame(const usb_video_frame_descriptor& descriptor,
++	bool compressed)
++{
++	uvc_frame frame;
++	frame.width = descriptor.width;
++	frame.height = descriptor.height;
++	frame.formatIndex = fParsedFormatIndex;
++	// The probe request wants the descriptor's own frame index, which
++	// starts at 1, not the position in our list.
++	frame.frameIndex = descriptor.frame_index;
++	frame.interval = descriptor.default_frame_interval;
++	frame.compressed = compressed;
++	uvc_frame_list_add(&fFrames, frame);
++}
++
++
+ 
+ UVCCamDeviceAddon::UVCCamDeviceAddon(WebCamMediaAddOn* webcam)
+ 	: CamDeviceAddon(webcam)
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 07bd5725cc..3c743b044e 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -10,10 +10,15 @@
+ 
+ #include "CamDevice.h"
+ #include "UVCControls.h"
++#include "UVCFrameList.h"
++#include "UVCJpegDecoder.h"
+ #include "USB_video.h"
+ #include <usb/USB_video.h>
+ 
+ 
++class CamFrame;
++
++
+ class UVCCamDevice : public CamDevice {
+ public:
+ 								UVCCamDevice(CamDeviceAddon &_addon,
+@@ -28,8 +33,8 @@ public:
+ 	virtual status_t			AcceptVideoFrame(uint32 &width,
+ 									uint32 &height);
+ 	virtual int32				CountVideoSizes() const;
+-	virtual bool				VideoSizeAt(int32 index, uint32 &width,
+-									uint32 &height, uint32 &interval) const;
++	virtual bool				VideoSizeAt(int32 index,
++									cam_video_size& size) const;
+ 	virtual void				AddParameters(BParameterGroup *group,
+ 									int32 &index);
+ 	virtual status_t			GetParameterValue(int32 id,
+@@ -48,6 +53,11 @@ private:
+ 			void				_ParseVideoStreaming(
+ 									const usbvc_class_descriptor* descriptor,
+ 									size_t len);
++			void				_AddFrame(
++									const usb_video_frame_descriptor& descriptor,
++									bool compressed);
++			status_t			_Decode(const CamFrame& frame,
++									const uvc_picture& picture);
+ 			status_t			_ProbeCommitFormat();
+ 			status_t			_SelectBestAlternate();
+ 			status_t			_ResetDeframer();
+@@ -79,15 +89,14 @@ private:
+ 			uint32				fControlIndex;
+ 			uint16				fControlRequestIndex;
+ 			uint32				fStreamingIndex;
+-			uint32				fUncompressedFormatIndex;
+-			uint32				fUncompressedFrameIndex;
+-			uint32				fMJPEGFormatIndex;
+-			uint32				fMJPEGFrameIndex;
++			uint8				fParsedFormatIndex;
++			uint8				fParsedFormat;
+ 			uint32				fMaxVideoFrameSize;
+ 			uint32				fMaxPayloadTransferSize;
+ 
+-			BList				fUncompressedFrames;
+-			BList				fMJPEGFrames;
++			uvc_frame_list		fFrames;
++			uvc_frame			fFrame;
++			UVCJpegDecoder		fJpegDecoder;
+ 
+ 			uint16				fCameraRequestIndex;
+ 			uint8				fCameraControls;
+diff --git a/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp b/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
+index 117eb3d9ba..4a71dd1a39 100644
+--- a/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
++++ b/src/tests/add-ons/media/usb_webcam/CamVideoSizeTest.cpp
+@@ -68,18 +68,49 @@ test_frame_rate_from_the_interval()
+ }
+ 
+ 
++static cam_video_size
++make_size(uint32_t width, uint32_t height, uint32_t interval,
++	const char* format)
++{
++	cam_video_size size;
++	size.width = width;
++	size.height = height;
++	size.interval = interval;
++	size.format = format;
++	return size;
++}
++
++
+ static void
+ test_label_with_and_without_rate()
+ {
+ 	char label[48];
+-	cam_size_label(label, sizeof(label), 1920, 1080, 2000000);
++	cam_size_label(label, sizeof(label), make_size(1920, 1080, 2000000, NULL));
+ 	CHECK(strcmp(label, "1920 \xc3\x97 1080 (5 fps)") == 0);
+ 
+-	cam_size_label(label, sizeof(label), 640, 480, 0);
++	cam_size_label(label, sizeof(label), make_size(640, 480, 0, NULL));
+ 	CHECK(strcmp(label, "640 \xc3\x97 480") == 0);
+ }
+ 
+ 
++static void
++test_label_names_the_format()
++{
++	// Tells why one size runs at 30 and the next at 2 frames per second.
++	char label[64];
++	cam_size_label(label, sizeof(label),
++		make_size(1920, 1080, 333333, "MJPEG"));
++	CHECK(strcmp(label, "1920 \xc3\x97 1080 (30 fps, MJPEG)") == 0);
++
++	cam_size_label(label, sizeof(label),
++		make_size(2560, 1472, 5000000, "uncompressed"));
++	CHECK(strcmp(label, "2560 \xc3\x97 1472 (2 fps, uncompressed)") == 0);
++
++	cam_size_label(label, sizeof(label), make_size(640, 480, 0, "MJPEG"));
++	CHECK(strcmp(label, "640 \xc3\x97 480 (MJPEG)") == 0);
++}
++
++
+ static void
+ test_only_sizes_up_to_the_limit_are_allowed()
+ {
+@@ -110,6 +141,7 @@ main()
+ 	RUN(test_frame_rate_from_the_interval);
+ 	RUN(test_label_with_and_without_rate);
+ 	RUN(test_only_sizes_up_to_the_limit_are_allowed);
++	RUN(test_label_names_the_format);
+ 
+ 	printf("%d tests, %d failures\n", sTests, sFailures);
+ 	return sFailures == 0 ? 0 : 1;
+-- 
+2.54.1
+

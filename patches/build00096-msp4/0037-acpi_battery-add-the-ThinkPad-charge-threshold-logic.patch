@@ -1,0 +1,422 @@
+From 9835838e07ddc07f0888e79217762dc230fa084a Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 19:55:20 +0000
+Subject: [PATCH 37/43] acpi_battery: add the ThinkPad charge threshold logic
+ and tests
+
+ThinkPads can stop charging below 100 percent. The hotkey device of
+the firmware reads the thresholds with BCTG and BCSG and sets them
+with BCCS and BCSS. Add the pure logic for these methods, following
+the thinkpad_acpi driver of Linux: bit 8 of a result marks support,
+bit 9 individual addressing and bit 31 an error; the threshold is in
+the low byte, and a stop of 0 means a full charge. The argument
+carries the battery in bits 8 and 9, BAT0 being 1 and BAT1 being 2.
+Other device names are not guessed.
+
+A threshold pair is valid when stop is 1 to 100 and start is below
+stop; a start of 0 leaves it to the firmware. When a new pair is set,
+the start goes first if the limit is lowered, so that the start never
+lies above the stop in between.
+
+The logic has no kernel dependencies and is tested on the host.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 36295c9ced45682c233b7a0b534da2f0ee8a79e2)
+---
+ .../acpi_battery/thinkpad_charge_logic.cpp    | 116 +++++++++++
+ .../acpi_battery/thinkpad_charge_logic.h      |  37 ++++
+ src/tests/add-ons/kernel/drivers/Jamfile      |   1 +
+ .../add-ons/kernel/drivers/power/Jamfile      |   7 +
+ .../drivers/power/ThinkPadChargeTest.cpp      | 187 ++++++++++++++++++
+ 5 files changed, 348 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.cpp
+ create mode 100644 src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.h
+ create mode 100644 src/tests/add-ons/kernel/drivers/power/Jamfile
+ create mode 100644 src/tests/add-ons/kernel/drivers/power/ThinkPadChargeTest.cpp
+
+diff --git a/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.cpp b/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.cpp
+new file mode 100644
+index 0000000000..16b695a643
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.cpp
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "thinkpad_charge_logic.h"
++
++#include <string.h>
++
++
++// Bits of the values the BCTG and BCSG methods return.
++#define THINKPAD_RESULT_SUPPORTED	(1UL << 8)
++#define THINKPAD_RESULT_INDIVIDUAL	(1UL << 9)
++#define THINKPAD_RESULT_ERROR		(1UL << 31)
++#define THINKPAD_THRESHOLD_MASK		0xff
++
++
++/*!	Returns the number the embedded controller uses for the battery whose
++	ACPI device is at \a acpiPath. Like Linux, it goes by the name of the
++	device: BAT0 is the primary battery, BAT1 the secondary one. Any other
++	name is not guessed.
++*/
++int32
++thinkpad_battery_from_path(const char* acpiPath)
++{
++	if (acpiPath == NULL)
++		return THINKPAD_BATTERY_UNKNOWN;
++
++	const char* name = strrchr(acpiPath, '.');
++	name = name != NULL ? name + 1 : acpiPath;
++
++	if (strcmp(name, "BAT0") == 0)
++		return THINKPAD_BATTERY_PRIMARY;
++	if (strcmp(name, "BAT1") == 0)
++		return THINKPAD_BATTERY_SECONDARY;
++	return THINKPAD_BATTERY_UNKNOWN;
++}
++
++
++bool
++thinkpad_call_failed(uint32 result)
++{
++	return (result & THINKPAD_RESULT_ERROR) != 0;
++}
++
++
++bool
++thinkpad_threshold_supported(uint32 result)
++{
++	return !thinkpad_call_failed(result)
++		&& (result & THINKPAD_RESULT_SUPPORTED) != 0;
++}
++
++
++bool
++thinkpad_individual_addressing(uint32 result)
++{
++	return (result & THINKPAD_RESULT_INDIVIDUAL) != 0;
++}
++
++
++uint32
++thinkpad_start_from_result(uint32 result)
++{
++	return result & THINKPAD_THRESHOLD_MASK;
++}
++
++
++/*!	A stop threshold of 0 is the default of the embedded controller: the
++	battery is charged fully.
++*/
++uint32
++thinkpad_stop_from_result(uint32 result)
++{
++	uint32 stop = result & THINKPAD_THRESHOLD_MASK;
++	return stop == 0 ? 100 : stop;
++}
++
++
++uint32
++thinkpad_start_argument(int32 battery, uint32 start)
++{
++	return ((uint32)battery << 8) | (start & THINKPAD_THRESHOLD_MASK);
++}
++
++
++uint32
++thinkpad_stop_argument(int32 battery, uint32 stop)
++{
++	if (stop == 100)
++		stop = 0;
++	return ((uint32)battery << 8) | (stop & THINKPAD_THRESHOLD_MASK);
++}
++
++
++/*!	Charging stops at \a stop, 1 to 100 percent, and starts again below
++	\a start, which must be lower. A start of 0 leaves it to the firmware.
++*/
++bool
++charge_thresholds_valid(uint32 start, uint32 stop)
++{
++	return stop >= 1 && stop <= 100 && start < stop;
++}
++
++
++/*!	Returns whether the new start must be set before the new \a stop, so
++	that the start never lies above the stop in between.
++*/
++bool
++charge_set_start_first(uint32 currentStart, uint32 stop)
++{
++	return stop <= currentStart;
++}
+diff --git a/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.h b/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.h
+new file mode 100644
+index 0000000000..c62696a182
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/acpi_battery/thinkpad_charge_logic.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef THINKPAD_CHARGE_LOGIC_H
++#define THINKPAD_CHARGE_LOGIC_H
++
++
++#include <SupportDefs.h>
++
++
++// Battery numbers of the ThinkPad embedded controller.
++enum {
++	THINKPAD_BATTERY_UNKNOWN	= 0,
++	THINKPAD_BATTERY_PRIMARY	= 1,
++	THINKPAD_BATTERY_SECONDARY	= 2
++};
++
++
++int32	thinkpad_battery_from_path(const char* acpiPath);
++
++bool	thinkpad_threshold_supported(uint32 result);
++bool	thinkpad_individual_addressing(uint32 result);
++bool	thinkpad_call_failed(uint32 result);
++
++uint32	thinkpad_start_from_result(uint32 result);
++uint32	thinkpad_stop_from_result(uint32 result);
++uint32	thinkpad_start_argument(int32 battery, uint32 start);
++uint32	thinkpad_stop_argument(int32 battery, uint32 stop);
++
++bool	charge_thresholds_valid(uint32 start, uint32 stop);
++bool	charge_set_start_first(uint32 currentStart, uint32 stop);
++
++
++#endif	// THINKPAD_CHARGE_LOGIC_H
+diff --git a/src/tests/add-ons/kernel/drivers/Jamfile b/src/tests/add-ons/kernel/drivers/Jamfile
+index a9a19970e5..08236ad56a 100644
+--- a/src/tests/add-ons/kernel/drivers/Jamfile
++++ b/src/tests/add-ons/kernel/drivers/Jamfile
+@@ -4,5 +4,6 @@ SubInclude HAIKU_TOP src tests add-ons kernel drivers audio ;
+ SubInclude HAIKU_TOP src tests add-ons kernel drivers edu ;
+ SubInclude HAIKU_TOP src tests add-ons kernel drivers hpet ;
+ SubInclude HAIKU_TOP src tests add-ons kernel drivers nvmm ;
++SubInclude HAIKU_TOP src tests add-ons kernel drivers power ;
+ SubInclude HAIKU_TOP src tests add-ons kernel drivers random ;
+ SubInclude HAIKU_TOP src tests add-ons kernel drivers tty ;
+diff --git a/src/tests/add-ons/kernel/drivers/power/Jamfile b/src/tests/add-ons/kernel/drivers/power/Jamfile
+new file mode 100644
+index 0000000000..27bd3fd1e9
+--- /dev/null
++++ b/src/tests/add-ons/kernel/drivers/power/Jamfile
+@@ -0,0 +1,7 @@
++SubDir HAIKU_TOP src tests add-ons kernel drivers power ;
++
++SubDirHdrs $(HAIKU_TOP) src add-ons kernel drivers power acpi_battery ;
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons kernel drivers power
++	acpi_battery ] ;
++
++SimpleTest ThinkPadChargeTest : ThinkPadChargeTest.cpp thinkpad_charge_logic.cpp ;
+diff --git a/src/tests/add-ons/kernel/drivers/power/ThinkPadChargeTest.cpp b/src/tests/add-ons/kernel/drivers/power/ThinkPadChargeTest.cpp
+new file mode 100644
+index 0000000000..803b6fc18b
+--- /dev/null
++++ b/src/tests/add-ons/kernel/drivers/power/ThinkPadChargeTest.cpp
+@@ -0,0 +1,187 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "thinkpad_charge_logic.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_battery_number_comes_from_the_device_name()
++{
++	// The embedded controller counts BAT0 as 1 and BAT1 as 2, like the
++	// thinkpad_acpi driver of Linux does.
++	CHECK(thinkpad_battery_from_path("\\_SB_.PCI0.LPCB.BAT0")
++		== THINKPAD_BATTERY_PRIMARY);
++	CHECK(thinkpad_battery_from_path("\\_SB_.PCI0.LPCB.BAT1")
++		== THINKPAD_BATTERY_SECONDARY);
++	CHECK(thinkpad_battery_from_path("BAT0") == THINKPAD_BATTERY_PRIMARY);
++}
++
++
++static void
++test_other_device_names_are_not_guessed()
++{
++	CHECK(thinkpad_battery_from_path("\\_SB_.PCI0.LPCB.BAT2")
++		== THINKPAD_BATTERY_UNKNOWN);
++	CHECK(thinkpad_battery_from_path("\\_SB_.BAT0X") == THINKPAD_BATTERY_UNKNOWN);
++	CHECK(thinkpad_battery_from_path("\\_SB_.XBAT0") == THINKPAD_BATTERY_UNKNOWN);
++	CHECK(thinkpad_battery_from_path("\\_SB_.PCI0.BAT0.") == THINKPAD_BATTERY_UNKNOWN);
++	CHECK(thinkpad_battery_from_path("") == THINKPAD_BATTERY_UNKNOWN);
++	CHECK(thinkpad_battery_from_path(NULL) == THINKPAD_BATTERY_UNKNOWN);
++}
++
++
++static void
++test_bit_8_marks_support()
++{
++	// Start 75 and stop 80, with the support bits set.
++	CHECK(thinkpad_threshold_supported(0x34b));
++	CHECK(thinkpad_threshold_supported(0x350));
++	CHECK(thinkpad_threshold_supported(0x100));
++	CHECK(!thinkpad_threshold_supported(0x000));
++	CHECK(!thinkpad_threshold_supported(0x04b));
++}
++
++
++static void
++test_bit_31_is_an_error()
++{
++	CHECK(thinkpad_call_failed(0x80000000));
++	CHECK(!thinkpad_threshold_supported(0x80000100));
++	CHECK(!thinkpad_call_failed(0x34b));
++}
++
++
++static void
++test_bit_9_marks_individual_addressing()
++{
++	CHECK(thinkpad_individual_addressing(0x34b));
++	CHECK(!thinkpad_individual_addressing(0x14b));
++}
++
++
++static void
++test_thresholds_are_in_the_low_byte()
++{
++	CHECK(thinkpad_start_from_result(0x34b) == 75);
++	CHECK(thinkpad_stop_from_result(0x350) == 80);
++	CHECK(thinkpad_start_from_result(0x300) == 0);
++}
++
++
++static void
++test_stop_0_means_full_charge()
++{
++	CHECK(thinkpad_stop_from_result(0x300) == 100);
++	CHECK(thinkpad_stop_from_result(0x364) == 100);
++}
++
++
++static void
++test_arguments_carry_the_battery_in_bits_8_and_9()
++{
++	CHECK(thinkpad_start_argument(THINKPAD_BATTERY_PRIMARY, 75) == 0x14b);
++	CHECK(thinkpad_start_argument(THINKPAD_BATTERY_SECONDARY, 55) == 0x237);
++	CHECK(thinkpad_stop_argument(THINKPAD_BATTERY_PRIMARY, 80) == 0x150);
++	CHECK(thinkpad_stop_argument(THINKPAD_BATTERY_SECONDARY, 60) == 0x23c);
++	CHECK(thinkpad_start_argument(THINKPAD_BATTERY_PRIMARY, 0) == 0x100);
++}
++
++
++static void
++test_full_charge_is_sent_as_0()
++{
++	// The embedded controller reads 0 as its default, a full charge.
++	CHECK(thinkpad_stop_argument(THINKPAD_BATTERY_PRIMARY, 100) == 0x100);
++	CHECK(thinkpad_stop_argument(THINKPAD_BATTERY_SECONDARY, 100) == 0x200);
++}
++
++
++static void
++test_valid_thresholds()
++{
++	CHECK(charge_thresholds_valid(75, 80));
++	CHECK(charge_thresholds_valid(55, 60));
++	CHECK(charge_thresholds_valid(0, 100));
++	CHECK(charge_thresholds_valid(0, 1));
++	CHECK(charge_thresholds_valid(99, 100));
++}
++
++
++static void
++test_invalid_thresholds()
++{
++	CHECK(!charge_thresholds_valid(0, 0));
++	CHECK(!charge_thresholds_valid(0, 101));
++	CHECK(!charge_thresholds_valid(80, 80));
++	CHECK(!charge_thresholds_valid(85, 80));
++	CHECK(!charge_thresholds_valid(100, 100));
++	CHECK(!charge_thresholds_valid(0xffffffff, 80));
++}
++
++
++static void
++test_lowering_the_limit_sets_the_start_first()
++{
++	// From 75/80 to 55/60: setting the stop first would leave 75/60.
++	CHECK(charge_set_start_first(75, 60));
++	CHECK(charge_set_start_first(75, 75));
++}
++
++
++static void
++test_raising_the_limit_sets_the_stop_first()
++{
++	// From 55/60 to 75/80: setting the start first would leave 75/60.
++	CHECK(!charge_set_start_first(55, 80));
++	CHECK(!charge_set_start_first(0, 100));
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_battery_number_comes_from_the_device_name);
++	RUN(test_other_device_names_are_not_guessed);
++	RUN(test_bit_8_marks_support);
++	RUN(test_bit_31_is_an_error);
++	RUN(test_bit_9_marks_individual_addressing);
++	RUN(test_thresholds_are_in_the_low_byte);
++	RUN(test_stop_0_means_full_charge);
++	RUN(test_arguments_carry_the_battery_in_bits_8_and_9);
++	RUN(test_full_charge_is_sent_as_0);
++	RUN(test_valid_thresholds);
++	RUN(test_invalid_thresholds);
++	RUN(test_lowering_the_limit_sets_the_start_first);
++	RUN(test_raising_the_limit_sets_the_stop_first);
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

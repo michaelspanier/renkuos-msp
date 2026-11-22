@@ -1,0 +1,349 @@
+From ec0ba00340085dc8cfe989a42c817e9d24ba544d Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:24:40 +0000
+Subject: [PATCH 06/43] usb_webcam: add a YUY2 conversion for UVC and its tests
+
+UVC cameras send uncompressed video as YUY2. The UVC add-on treats
+it as a Bayer pattern, which gives wrong colours. UVCColor.h converts
+YUY2 (limited range, BT.601) to B_RGB32 and tells whether a frame
+holds a whole picture. It needs no camera, so it can be tested on
+its own. The next commit uses it.
+
+UVCColorTest pins the conversion down; UVCColorBenchmark measures it
+(0.95 ms for 640x480 on an i7-7500U).
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 00ff152d03991485c6271152f4cb22d5bc775eb1)
+---
+ .../usb_webcam/addons/uvc/UVCColor.h          |  61 +++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   2 +
+ .../media/usb_webcam/UVCColorBenchmark.cpp    |  72 ++++++++
+ .../add-ons/media/usb_webcam/UVCColorTest.cpp | 157 ++++++++++++++++++
+ 4 files changed, 292 insertions(+)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCColor.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
+ create mode 100644 src/tests/add-ons/media/usb_webcam/UVCColorTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCColor.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCColor.h
+new file mode 100644
+index 0000000000..1ac63af815
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCColor.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef UVC_COLOR_H
++#define UVC_COLOR_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++static inline uint8_t
++uvc_clamp_to_byte(int32_t value)
++{
++	return value < 0 ? 0 : (value > 255 ? 255 : value);
++}
++
++
++/*!	Tells whether a YUY2 frame of \a frameLength bytes holds a whole picture of
++	the given size and fits into an output buffer of \a outputSize bytes. A
++	shorter frame was damaged on the way.
++*/
++static inline bool
++uvc_yuy2_frame_fits(size_t frameLength, size_t outputSize, int32_t width,
++	int32_t height)
++{
++	if (width <= 0 || height <= 0)
++		return false;
++	size_t pixels = (size_t)width * height;
++	return frameLength >= pixels * 2 && outputSize >= pixels * 4;
++}
++
++
++/*!	Converts YUY2 (Y0 U Y1 V, limited range, BT.601) to B_RGB32. The caller
++	checks once that \a src holds width * height * 2 bytes and \a dst
++	width * height * 4; the loop itself does not check.
++*/
++static inline void
++uvc_decode_yuy2(uint8_t* dst, const uint8_t* src, int32_t width,
++	int32_t height)
++{
++	for (int32_t i = 0; i < width * height / 2; i++) {
++		int32_t u = src[1] - 128;
++		int32_t v = src[3] - 128;
++		for (int32_t k = 0; k < 2; k++) {
++			int32_t c = (src[k * 2] - 16) * 298 + 128;
++			dst[0] = uvc_clamp_to_byte((c + 516 * u) >> 8);
++			dst[1] = uvc_clamp_to_byte((c - 100 * u - 208 * v) >> 8);
++			dst[2] = uvc_clamp_to_byte((c + 409 * v) >> 8);
++			dst[3] = 255;
++			dst += 4;
++		}
++		src += 4;
++	}
++}
++
++
++#endif	// UVC_COLOR_H
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index dba4bbeae4..a77bec71e3 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -1,4 +1,6 @@
+ SubDir HAIKU_TOP src tests add-ons media usb_webcam ;
+ 
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
++SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
++SimpleTest UVCColorTest : UVCColorTest.cpp ;
+ SimpleTest UVCPayloadTest : UVCPayloadTest.cpp ;
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp b/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
+new file mode 100644
+index 0000000000..9ffe7d38df
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++//	Measures the YUY2 to B_RGB32 conversion: median of 20 runs.
++
++
++#include "UVCColor.h"
++
++#include <algorithm>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++
++static const int kRuns = 20;
++
++
++static double
++now_seconds()
++{
++	struct timespec time;
++	clock_gettime(CLOCK_MONOTONIC, &time);
++	return time.tv_sec + time.tv_nsec / 1e9;
++}
++
++
++static void
++measure(int width, int height)
++{
++	size_t inSize = (size_t)width * height * 2;
++	size_t outSize = (size_t)width * height * 4;
++	uint8_t* in = (uint8_t*)malloc(inSize);
++	uint8_t* out = (uint8_t*)malloc(outSize);
++	for (size_t i = 0; i < inSize; i++)
++		in[i] = (uint8_t)(i * 37 + 11);
++
++	double decode[kRuns];
++	double clear[kRuns];
++	for (int run = 0; run < kRuns; run++) {
++		double start = now_seconds();
++		memset(out, 0, outSize);
++		double middle = now_seconds();
++		uvc_decode_yuy2(out, in, width, height);
++		double end = now_seconds();
++		clear[run] = middle - start;
++		decode[run] = end - middle;
++	}
++	std::sort(decode, decode + kRuns);
++	std::sort(clear, clear + kRuns);
++	double decodeMedian = decode[kRuns / 2];
++	double clearMedian = clear[kRuns / 2];
++	printf("%4dx%-4d  Umrechnung %.2f ms (%.0f MB/s Eingang)   memset %.2f ms"
++		"   Prüfsumme %d\n", width, height, decodeMedian * 1000,
++		inSize / decodeMedian / 1e6, clearMedian * 1000, out[outSize / 3]);
++	free(in);
++	free(out);
++}
++
++
++int
++main()
++{
++	measure(640, 480);
++	measure(1280, 720);
++	return 0;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCColorTest.cpp b/src/tests/add-ons/media/usb_webcam/UVCColorTest.cpp
+new file mode 100644
+index 0000000000..063470bcc2
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/UVCColorTest.cpp
+@@ -0,0 +1,157 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "UVCColor.h"
++
++#include <stdio.h>
++#include <string.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++//	B_RGB32 is blue, green, red, alpha in memory. The input is limited range
++//	BT.601: Y from 16 (black) to 235 (white), U and V around 128.
++
++
++static bool
++pixel_is(const uint8_t* pixel, int blue, int green, int red)
++{
++	return pixel[0] == blue && pixel[1] == green && pixel[2] == red
++		&& pixel[3] == 255;
++}
++
++
++static void
++decode_one_pair(uint8_t y0, uint8_t u, uint8_t y1, uint8_t v, uint8_t* out)
++{
++	const uint8_t in[4] = { y0, u, y1, v };
++	uvc_decode_yuy2(out, in, 2, 1);
++}
++
++
++static void
++test_black_white_and_gray()
++{
++	uint8_t out[8];
++	decode_one_pair(16, 128, 235, 128, out);
++	CHECK(pixel_is(out, 0, 0, 0));
++	CHECK(pixel_is(out + 4, 255, 255, 255));
++
++	decode_one_pair(126, 128, 126, 128, out);
++	CHECK(pixel_is(out, 128, 128, 128));
++}
++
++
++static void
++test_pure_red()
++{
++	uint8_t out[8];
++	decode_one_pair(81, 90, 81, 240, out);
++	CHECK(pixel_is(out, 0, 0, 255));
++}
++
++
++static void
++test_values_outside_the_range_are_clamped()
++{
++	uint8_t out[8];
++	decode_one_pair(255, 255, 0, 255, out);
++	// Bright Y with strong U and V runs over 255 in blue and red.
++	CHECK(out[0] == 255 && out[2] == 255);
++	// Y = 0 with strong U and V gives a negative green.
++	CHECK(out[4 + 1] == 0);
++}
++
++
++static void
++test_both_pixels_share_u_and_v()
++{
++	uint8_t out[8];
++	decode_one_pair(81, 90, 145, 54, out);
++	// Same color difference, different brightness: the second is lighter.
++	CHECK(out[4 + 1] > out[1]);
++	CHECK(out[3] == 255 && out[7] == 255);
++}
++
++
++static void
++test_whole_picture_is_written_and_nothing_after_it()
++{
++	const int kWidth = 4;
++	const int kHeight = 2;
++	uint8_t in[kWidth * kHeight * 2];
++	for (size_t i = 0; i < sizeof(in); i += 4) {
++		in[i] = 235;
++		in[i + 1] = 128;
++		in[i + 2] = 235;
++		in[i + 3] = 128;
++	}
++	uint8_t out[kWidth * kHeight * 4 + 4];
++	memset(out, 7, sizeof(out));
++	uvc_decode_yuy2(out, in, kWidth, kHeight);
++	for (int i = 0; i < kWidth * kHeight; i++)
++		CHECK(pixel_is(out + i * 4, 255, 255, 255));
++	CHECK(out[kWidth * kHeight * 4] == 7);
++}
++
++
++static void
++test_clamp()
++{
++	CHECK(uvc_clamp_to_byte(-5) == 0);
++	CHECK(uvc_clamp_to_byte(0) == 0);
++	CHECK(uvc_clamp_to_byte(200) == 200);
++	CHECK(uvc_clamp_to_byte(300) == 255);
++}
++
++
++static void
++test_frame_fits_only_when_both_buffers_are_large_enough()
++{
++	CHECK(uvc_yuy2_frame_fits(614400, 1228800, 640, 480));
++	CHECK(!uvc_yuy2_frame_fits(614399, 1228800, 640, 480));
++	CHECK(!uvc_yuy2_frame_fits(614400, 1228799, 640, 480));
++	CHECK(!uvc_yuy2_frame_fits(0, 0, 0, 480));
++	CHECK(!uvc_yuy2_frame_fits(100, 100, -2, 480));
++}
++
++
++#define RUN(test) \
++	do { \
++		int before = sFailures; \
++		test(); \
++		sTests++; \
++		printf("%s %s\n", sFailures == before ? "ok  " : "FAIL", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_black_white_and_gray);
++	RUN(test_pure_red);
++	RUN(test_values_outside_the_range_are_clamped);
++	RUN(test_both_pixels_share_u_and_v);
++	RUN(test_whole_picture_is_written_and_nothing_after_it);
++	RUN(test_clamp);
++	RUN(test_frame_fits_only_when_both_buffers_are_large_enough);
++
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+-- 
+2.54.1
+

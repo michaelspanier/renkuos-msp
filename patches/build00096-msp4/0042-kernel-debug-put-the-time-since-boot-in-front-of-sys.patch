@@ -1,0 +1,128 @@
+From 65caadbb9da1bff5d6a6576e8541cf6f596dd22f Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 21:56:18 +0000
+Subject: [PATCH 42/43] kernel/debug: put the time since boot in front of
+ syslog lines
+
+Kernel messages in the syslog had no time, so the boot could not be
+timed. Every line written through dprintf() now starts with the
+system time in seconds, e.g. "[    7.123] ". The kernel setting
+syslog_time_stamps turns it off.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ src/system/kernel/debug/debug.cpp | 55 ++++++++++++++++++++++++++++---
+ 1 file changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index cde05273ca..b4681ed3b3 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -82,6 +82,8 @@ extern "C" int kgets(char* buffer, int length);
+ void call_modules_hook(bool enter);
+ 
+ static void syslog_write(const char* text, int32 length, bool notify);
++static void syslog_write_stamped(const char* text, int32 length,
++	bool notify);
+ 
+ static arch_debug_registers sDebugRegisters[SMP_MAX_CPUS];
+ 
+@@ -89,6 +91,8 @@ static debug_page_fault_info sPageFaultInfo;
+ 
+ static bool sSerialDebugEnabled = true;
+ static bool sSyslogOutputEnabled = true;
++static bool sSyslogTimeStamps = true;
++static bool sSyslogAtLineStart = true;
+ static bool sBlueScreenEnabled = false;
+ 	// must always be false on startup
+ static bool sDebugScreenEnabled = false;
+@@ -1333,6 +1337,45 @@ syslog_write(const char* text, int32 length, bool notify)
+ }
+ 
+ 
++/*!	Writes \a text to the syslog and puts the time since boot in front of
++	every line, so that the boot can be timed from the syslog.
++	Must be called with the sSpinlock held.
++*/
++static void
++syslog_write_stamped(const char* text, int32 length, bool notify)
++{
++	if (!sSyslogTimeStamps) {
++		syslog_write(text, length, notify);
++		return;
++	}
++
++	while (length > 0) {
++		if (sSyslogAtLineStart) {
++			char stamp[32];
++			bigtime_t now = system_time();
++			int32 stampLength = snprintf(stamp, sizeof(stamp),
++				"[%5" B_PRId64 ".%03" B_PRId64 "] ", now / 1000000,
++				(now % 1000000) / 1000);
++			syslog_write(stamp, std::min(stampLength, (int32)sizeof(stamp) - 1),
++				false);
++			sSyslogAtLineStart = false;
++		}
++
++		const char* newLine = (const char*)memchr(text, '\n', length);
++		int32 chunk = newLine != NULL ? newLine - text + 1 : length;
++		syslog_write(text, chunk, false);
++		if (newLine != NULL)
++			sSyslogAtLineStart = true;
++
++		text += chunk;
++		length -= chunk;
++	}
++
++	if (notify && sSyslogBuffer != NULL)
++		release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
+ static status_t
+ syslog_init_post_threads(void)
+ {
+@@ -1553,7 +1596,7 @@ debug_output(const char* string, int32 length, bool notifySyslog)
+ 		if (sSerialDebugEnabled)
+ 			arch_debug_serial_puts(string);
+ 		if (sSyslogOutputEnabled)
+-			syslog_write(string, length, notifySyslog);
++			syslog_write_stamped(string, length, notifySyslog);
+ 		if (sBlueScreenEnabled || sDebugScreenEnabled)
+ 			blue_screen_puts(string);
+ 		if (sSerialDebugEnabled) {
+@@ -1585,7 +1628,7 @@ flush_pending_repeats(bool notifySyslog)
+ 		if (sSerialDebugEnabled)
+ 			arch_debug_serial_puts(temp);
+ 		if (sSyslogOutputEnabled)
+-			syslog_write(temp, length, notifySyslog);
++			syslog_write_stamped(temp, length, notifySyslog);
+ 		if (sBlueScreenEnabled || sDebugScreenEnabled)
+ 			blue_screen_puts(temp);
+ 		if (sSerialDebugEnabled) {
+@@ -1600,8 +1643,10 @@ flush_pending_repeats(bool notifySyslog)
+ 
+ 		if (sSerialDebugEnabled)
+ 			arch_debug_serial_puts(sLastOutputBuffer);
+-		if (sSyslogOutputEnabled)
+-			syslog_write(sLastOutputBuffer, length, notifySyslog);
++		if (sSyslogOutputEnabled) {
++			syslog_write_stamped(sLastOutputBuffer, length,
++				notifySyslog);
++		}
+ 		if (sBlueScreenEnabled || sDebugScreenEnabled)
+ 			blue_screen_puts(sLastOutputBuffer);
+ 		if (sSerialDebugEnabled) {
+@@ -1756,6 +1801,8 @@ debug_init_post_settings(struct kernel_args* args)
+ 		sSerialDebugEnabled);
+ 	sSyslogOutputEnabled = get_safemode_boolean("syslog_debug_output",
+ 		sSyslogOutputEnabled);
++	sSyslogTimeStamps = get_safemode_boolean("syslog_time_stamps",
++		sSyslogTimeStamps);
+ 	sBlueScreenOutput = get_safemode_boolean("bluescreen", true);
+ 	sEmergencyKeysEnabled = get_safemode_boolean("emergency_keys",
+ 		sEmergencyKeysEnabled);
+-- 
+2.54.1
+

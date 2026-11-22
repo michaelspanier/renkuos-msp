@@ -1,0 +1,44 @@
+From 76bb08243c07d199bcbaa5209a5c8a525983794c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 21:15:21 +0100
+Subject: [PATCH 20/43] wlan, usb_webcam: no debug output in normal use
+
+The net80211 glue printed a line for each wlan_control ioctl (dozens a
+minute while the network preferences or the status applet ask), and the
+UVC add-on a line each time its brand name is asked.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+(cherry picked from commit 2d39e9a49faef2e25a744ae69ecb7e17129d547f)
+---
+ .../media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp  | 1 -
+ src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp       | 2 +-
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 722f0890db..2c8c1d15b4 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -1545,7 +1545,6 @@ UVCCamDeviceAddon::~UVCCamDeviceAddon()
+ const char *
+ UVCCamDeviceAddon::BrandName()
+ {
+-	printf("UVCCamDeviceAddon::BrandName()\n");
+ 	return "USB Video Class";
+ }
+ 
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+index ef4ca638bf..41f1449cc9 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+@@ -62,7 +62,7 @@ extern "C" {
+ #include <shared.h>
+ 
+ 
+-#define TRACE_WLAN
++//#define TRACE_WLAN
+ #ifdef TRACE_WLAN
+ #	define TRACE(x...) dprintf(x);
+ #else
+-- 
+2.54.1
+

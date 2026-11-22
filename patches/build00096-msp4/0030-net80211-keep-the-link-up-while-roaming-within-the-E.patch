@@ -1,0 +1,143 @@
+From fab9aefdb606c8fbdd1d69e5129f7c6d373f1d30 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 17:01:31 +0000
+Subject: [PATCH 30/43] net80211: keep the link up while roaming within the ESS
+
+Every state change in ieee80211_newstate() sets the link down. On
+Haiku this reaches net_server, which removes the routes and the DHCP
+client of the interface, releases the lease and requests it again once
+the link is back. A switch to another AP of the same ESS thus broke
+all connections for a few seconds.
+
+After a background scan selected a new AP, keep reporting the link as
+up for at most 5 s while the station authenticates, associates and
+runs the 4-way handshake. When the new AP lets traffic through, send
+the usual join notification with the new BSSID. If the switch fails
+(the station goes back to SCAN) or takes longer, the link goes down as
+before.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+---
+ .../compat/openbsd_wlan/net80211/ieee80211.c     |  4 ++++
+ .../openbsd_wlan/net80211/ieee80211_node.c       | 15 +++++++++++++--
+ .../openbsd_wlan/net80211/ieee80211_node.h       |  1 +
+ .../openbsd_wlan/net80211/ieee80211_proto.c      | 16 ++++++++++++++++
+ .../compat/openbsd_wlan/net80211/ieee80211_var.h |  1 +
+ 5 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211.c
+index 0eaea85ab5..19fc304ad5 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211.c
+@@ -812,6 +812,10 @@ ieee80211_media_status(struct ifnet *ifp, struct ifmediareq *imr)
+ 	     !(ic->ic_flags & IEEE80211_F_RSNON) ||
+ 	     ic->ic_bss->ni_port_valid))
+ 		imr->ifm_status |= IFM_ACTIVE;
++#ifdef __HAIKU__
++	else if (ieee80211_roaming(ic))
++		imr->ifm_status |= IFM_ACTIVE;
++#endif
+ 	imr->ifm_active |= IFM_AUTO;
+ 	switch (ic->ic_opmode) {
+ 	case IEEE80211_M_STA:
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+index a5d521357d..bd2535aa68 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.c
+@@ -1339,6 +1339,7 @@ ieee80211_node_switch_bss(struct ieee80211com *ic, struct ieee80211_node *ni)
+ #define IEEE80211_ROAM_DWELL		30000	/* msec */
+ #define IEEE80211_ROAM_SCAN_MIN		5000	/* msec */
+ #define IEEE80211_ROAM_SCAN_MAX		60000	/* msec */
++#define IEEE80211_ROAM_LINK_HOLD	5000000	/* usec, link up while roaming */
+ 
+ static long long
+ ieee80211_roam_now(void)
+@@ -1424,13 +1425,23 @@ ieee80211_roam_switch(struct ieee80211com *ic, struct ieee80211_node *curbs,
+ }
+ 
+ static void
+-ieee80211_roam_join(struct ieee80211com *ic)
++ieee80211_roam_join(struct ieee80211com *ic, int bgscan)
+ {
+ 	struct ieee80211_roam_params rp;
+ 
+ 	memset(&ic->ic_bss->ni_roam_avg, 0, sizeof(ic->ic_bss->ni_roam_avg));
+ 	ieee80211_roam_params(ic, ic->ic_bss, &rp);
+ 	ieee80211_roam_joined(&rp, &ic->ic_roam, ieee80211_roam_now());
++	ic->ic_roam_until = bgscan ?
++	    system_time() + IEEE80211_ROAM_LINK_HOLD : 0;
++}
++
++/* Moving to another AP of the ESS: the link counts as up meanwhile. */
++int
++ieee80211_roaming(struct ieee80211com *ic)
++{
++	return ic->ic_roam_until != 0 && ic->ic_state > IEEE80211_S_SCAN &&
++	    system_time() < ic->ic_roam_until;
+ }
+ #endif
+ 
+@@ -1489,7 +1500,7 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs)
+ 
+ #ifdef __HAIKU__
+ 		if (ic->ic_opmode == IEEE80211_M_STA)
+-			ieee80211_roam_join(ic);
++			ieee80211_roam_join(ic, bgscan);
+ #endif
+ 		timeout_del(&ic->ic_bgscan_timeout);
+ 		ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
+index 70c5cb8cff..ed59495bcc 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_node.h
+@@ -622,6 +622,7 @@ void ieee80211_reset_scan(struct ifnet *);
+ void ieee80211_notify_scan_done(struct ieee80211com *);
+ void ieee80211_roam_input(struct ieee80211com *, struct ieee80211_node *,
+ 		int);
++int ieee80211_roaming(struct ieee80211com *);
+ #endif
+ struct ieee80211_node *ieee80211_alloc_node(struct ieee80211com *,
+ 		const u_int8_t *);
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_proto.c b/src/libs/compat/openbsd_wlan/net80211/ieee80211_proto.c
+index 2806927130..07f85e3264 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_proto.c
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_proto.c
+@@ -1401,6 +1401,22 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
+ 	default:
+ 		break;
+ 	}
++#ifdef __HAIKU__
++	/*
++	 * Moving to another AP of the same ESS: keep the link up, so that
++	 * the stack keeps its routes and DHCP its lease. Report the new
++	 * BSSID once the new AP lets our traffic through.
++	 */
++	if (ic->ic_roam_until != 0) {
++		if (nstate == LINK_STATE_DOWN && ieee80211_roaming(ic))
++			return;
++		ic->ic_roam_until = 0;
++		if (nstate == LINK_STATE_UP && nstate == ifp->if_link_state) {
++			task_add(systq, &ic->ic_rtm_80211info_task);
++			return;
++		}
++	}
++#endif
+ 	if (nstate != ifp->if_link_state) {
+ #ifdef __FreeBSD_version
+ 		if_link_state_change(ifp, nstate);
+diff --git a/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h b/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
+index 5283000a2a..5019bd0bd3 100644
+--- a/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
++++ b/src/libs/compat/openbsd_wlan/net80211/ieee80211_var.h
+@@ -282,6 +282,7 @@ struct ieee80211com {
+ #ifdef __HAIKU__
+ 	bigtime_t		ic_last_raise_inact;
+ 	struct ieee80211_roam_state ic_roam;
++	bigtime_t		ic_roam_until;	/* link stays up until */
+ 	struct timeout		ic_slowtimo;	/* drives if_watchdog */
+ #endif
+ 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
+-- 
+2.54.1
+

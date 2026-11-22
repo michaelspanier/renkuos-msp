@@ -1,0 +1,61 @@
+From 84ca10ca18d642853e18422098f8b5910b22e3e7 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 19:55:21 +0000
+Subject: [PATCH 40/43] power: show the charge thresholds of a battery
+
+When the battery driver reports charge thresholds, print them after
+the health, for example "limit 75-80%".
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 57dfe70a1bca76288a9f65b6bf130da81af81e9d)
+---
+ src/bin/power/power.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/bin/power/power.cpp b/src/bin/power/power.cpp
+index 85421bdf68..3416d3098d 100644
+--- a/src/bin/power/power.cpp
++++ b/src/bin/power/power.cpp
+@@ -59,6 +59,8 @@ struct BatteryState {
+ 	acpi_battery_info			info;
+ 	acpi_extended_battery_info	extended;
+ 	bool						hasExtended;
++	acpi_battery_charge_thresholds	thresholds;
++	bool						hasThresholds;
+ 	status_t					status;
+ };
+ 
+@@ -160,12 +162,17 @@ static status_t
+ read_battery(int fd, BatteryState& battery)
+ {
+ 	battery.hasExtended = false;
++	battery.hasThresholds = false;
+ 	battery.status = B_ERROR;
+ 
+ 	if (ioctl(fd, GET_EXTENDED_BATTERY_INFO, &battery.extended,
+ 			sizeof(acpi_extended_battery_info)) == 0)
+ 		battery.hasExtended = true;
+ 
++	if (ioctl(fd, GET_BATTERY_CHARGE_THRESHOLDS, &battery.thresholds,
++			sizeof(acpi_battery_charge_thresholds)) == 0)
++		battery.hasThresholds = true;
++
+ 	if (ioctl(fd, GET_BATTERY_INFO, &battery.info,
+ 			sizeof(acpi_battery_info)) != 0) {
+ 		battery.status = errno;
+@@ -450,6 +457,11 @@ print_battery_line(int index, const BatteryState& battery)
+ 				/ battery.extended.design_capacity));
+ 	}
+ 
++	if (battery.hasThresholds) {
++		printf("  limit %" B_PRIu32 "-%" B_PRIu32 "%%",
++			battery.thresholds.start, battery.thresholds.stop);
++	}
++
+ 	printf("\n");
+ }
+ 
+-- 
+2.54.1
+

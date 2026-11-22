@@ -1,0 +1,818 @@
+From 108b25959f778cccbac9c3147201bc6bda039ee3 Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sat, 21 Nov 2026 06:27:43 +0000
+Subject: [PATCH 14/43] usb_webcam: survive unplugging, dead clients and
+ shutdown
+
+Unplugging a camera while it streamed crashed the add-on server: the
+USB device was deleted while the data pumps still used its
+endpoints. CamDevice::Unplugged() now stops new transfers, joins the
+pumps and only then lets go of the endpoints. Starting a transfer
+and the control requests check that the camera is still there.
+
+A camera plugged in again had no node, and the old node waited for
+the old device forever. The node now takes back a camera of the same
+name that shows up while its own camera is gone (CamReplug.h, tested
+by CamReplugTest), and restarts the stream at the connected size.
+
+When the application was killed, the producer kept sending into the
+dead port and the camera stayed taken. A failing SendBuffer() with
+B_BAD_PORT_ID now makes the control thread disconnect.
+
+Reading the resolution parameter no longer changes the size of the
+running stream.
+
+Stopping took two seconds because the C920 needs that long to answer
+SET_INTERFACE after streaming. The idle alternate setting is now
+selected in its own thread; whoever needs the interface next waits
+for it.
+
+The time source object is created while the media server is still
+there. BMediaEventLooper::ControlLoop() uses it without a NULL check,
+so a node that never streamed crashed when the services shut down.
+
+Tested on a ThinkPad T470s with a Logitech C920 (046d:08e5): pulled
+and plugged in while streaming, also at 1920x1080, the picture came
+back after about three seconds. 30 rounds of start, stop, size
+changes and kill -9 left no crash and no camera that kept sending.
+
+Signed-off-by: Michael Spanier <spanier.michael@gmail.com>
+Assisted-by: claude-opus-5-5
+(cherry picked from commit 82cefa286af6d1e74e29ae72f42815a521cb264b)
+---
+ .../media/media-add-ons/usb_webcam/AddOn.cpp  |  39 ++++++
+ .../media/media-add-ons/usb_webcam/AddOn.h    |   7 ++
+ .../media-add-ons/usb_webcam/CamDevice.cpp    |  31 ++++-
+ .../media-add-ons/usb_webcam/CamDevice.h      |   1 +
+ .../media-add-ons/usb_webcam/CamReplug.h      |  28 +++++
+ .../media-add-ons/usb_webcam/Producer.cpp     |  91 +++++++++++++-
+ .../media/media-add-ons/usb_webcam/Producer.h |   4 +
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 119 +++++++++++++++---
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |   6 +
+ .../media/usb_webcam/CamReplugTest.cpp        |  77 ++++++++++++
+ src/tests/add-ons/media/usb_webcam/Jamfile    |   1 +
+ .../media/usb_webcam/UVCColorBenchmark.cpp    |   6 +
+ 12 files changed, 385 insertions(+), 25 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/CamReplug.h
+ create mode 100644 src/tests/add-ons/media/usb_webcam/CamReplugTest.cpp
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
+index 97a1a7d5b9..6083040e5f 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.cpp
+@@ -19,6 +19,8 @@
+ 
+ WebCamMediaAddOn::WebCamMediaAddOn(image_id imid)
+ 	: BMediaAddOn(imid),
++	fNodeLock("webcam node"),
++	fNode(NULL),
+ 	fInitStatus(B_NO_INIT),
+ 	fRoster(NULL)
+ {
+@@ -150,6 +152,10 @@ WebCamMediaAddOn::InstantiateNodeFor(
+ 		node = NULL;
+ 	}
+ 
++	if (node != NULL) {
++		BAutolock lock(fNodeLock);
++		fNode = node;
++	}
+ 	return node;
+ }
+ 
+@@ -158,6 +164,13 @@ status_t
+ WebCamMediaAddOn::CameraAdded(CamDevice* device)
+ {
+ 	PRINT((CH "()" CT));
++	{
++		// The node may have lost its camera, and this may be that camera
++		// plugged in again.
++		BAutolock lock(fNodeLock);
++		if (fNode != NULL)
++			fNode->CameraPluggedIn();
++	}
+ 	NotifyFlavorChange();
+ 	return B_OK;
+ }
+@@ -172,6 +185,32 @@ WebCamMediaAddOn::CameraRemoved(CamDevice* device)
+ }
+ 
+ 
++void
++WebCamMediaAddOn::NodeDeleted(VideoProducer* node)
++{
++	BAutolock lock(fNodeLock);
++	if (fNode == node)
++		fNode = NULL;
++}
++
++
++CamDevice*
++WebCamMediaAddOn::PluggedCameraNamed(const char* name)
++{
++	CamDevice* found = NULL;
++	fRoster->Lock();
++	for (uint32 i = 0; i < fRoster->CountCameras() && found == NULL; i++) {
++		CamDevice* camera = fRoster->CameraAt(i);
++		if (camera != NULL && camera->IsPlugged()
++			&& strcmp(camera->FlavorInfo()->name, name) == 0) {
++			found = camera;
++		}
++	}
++	fRoster->Unlock();
++	return found;
++}
++
++
+ void
+ WebCamMediaAddOn::FillDefaultFlavorInfo(flavor_info* info)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
+index aaa08e77a9..a469097257 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/AddOn.h
+@@ -6,6 +6,7 @@
+ #define _VIDEO_ADDON_H
+ 
+ #include <media/MediaAddOn.h>
++#include <support/Locker.h>
+ 
+ #define TOUCH(x) ((void)(x))
+ 
+@@ -13,6 +14,7 @@ extern "C" _EXPORT BMediaAddOn *make_media_addon(image_id you);
+ 
+ class CamRoster;
+ class CamDevice;
++class VideoProducer;
+ 
+ class WebCamMediaAddOn : public BMediaAddOn {
+ public:
+@@ -43,8 +45,13 @@ public:
+ 		status_t		CameraAdded(CamDevice* device);
+ 		status_t		CameraRemoved(CamDevice* device);
+ 		void			FillDefaultFlavorInfo(flavor_info* info);
++		// for the node
++		void			NodeDeleted(VideoProducer* node);
++		CamDevice*		PluggedCameraNamed(const char* name);
+ 
+ private:
++	BLocker				fNodeLock;
++	VideoProducer*		fNode;
+ 	uint32				fInternalIDCounter;
+ 	status_t			fInitStatus;
+ 	flavor_info			fDefaultFlavorInfo;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 9f50a1a2dc..46ad07837e 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -45,6 +45,7 @@ CamDevice::CamDevice(CamDeviceAddon &_addon, BUSBDevice* _device)
+ 	  fSupportedDeviceIndex(-1),
+ 	  fChipIsBigEndian(false),
+ 	  fTransferEnabled(false),
++	  fPumpThread(-1),
+ 	  fLocker("WebcamDeviceLock"),
+ 	  fIsoQueued(0),
+ 	  fIsoDelivered(0)
+@@ -115,7 +116,12 @@ CamDevice::GetDevice()
+ void
+ CamDevice::Unplugged()
+ {
++	// The BUSBDevice and its endpoints are deleted after this call. Without
++	// the device nothing new starts; the data pumps use the endpoints until
++	// they end.
++	BAutolock lock(fLocker);
+ 	fDevice = NULL;
++	StopDataPumps();
+ 	fBulkIn = NULL;
+ 	fIsoIn = NULL;
+ }
+@@ -167,6 +173,8 @@ CamDevice::StartTransfer()
+ 	PRINT((CH "()" CT));
+ 	if (fTransferEnabled)
+ 		return EALREADY;
++	if (!IsPlugged())
++		return B_DEV_NOT_READY;
+ 	fPumpThread = spawn_thread(_DataPumpThread, "USB Webcam Data Pump", 50,
+ 		this);
+ 	if (fPumpThread < B_OK)
+@@ -193,14 +201,31 @@ CamDevice::StopTransfer()
+ 		err = fSensor->StopTransfer();
+ 	if (err < B_OK)
+ 		return err;
++	StopDataPumps();
++	return B_OK;
++}
++
++
++/*!	Ends the data pumps and waits for them. The caller holds fLocker once.
++	Unplugged() and StopTransfer() may both wait, so the thread is not
++	forgotten before it has ended.
++*/
++void
++CamDevice::StopDataPumps()
++{
+ 	fTransferEnabled = false;
++	const thread_id pump = fPumpThread;
++	if (pump < 0)
++		return;
+ 
+-	// the thread itself might Lock()
++	// The bulk pump locks fLocker for every transfer.
+ 	fLocker.Unlock();
+-	wait_for_thread(fPumpThread, &err);
++	status_t result;
++	wait_for_thread(pump, &result);
+ 	fLocker.Lock();
+ 
+-	return B_OK;
++	if (fPumpThread == pump)
++		fPumpThread = -1;
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index 372e22e5ae..c8d838b44a 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -133,6 +133,7 @@ class CamDevice {
+ 	virtual status_t	ProbeSensor();
+ 	virtual void		DataLost();
+ 	CamSensor			*CreateSensor(const char *name);
++		void			StopDataPumps();
+ 		status_t		fInitStatus;
+ 		flavor_info		fFlavorInfo;
+ 		media_format	fMediaFormat;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamReplug.h b/src/add-ons/media/media-add-ons/usb_webcam/CamReplug.h
+new file mode 100644
+index 0000000000..86b2c6108d
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamReplug.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef CAM_REPLUG_H
++#define CAM_REPLUG_H
++
++
++#include <string.h>
++
++
++/*!	Whether a camera just plugged in replaces the one a node streams from.
++	The node keeps its camera while that one works; it takes only the same
++	model back, which is how a camera unplugged and plugged in again shows up.
++*/
++static inline bool
++cam_takes_over(bool currentPlugged, const char* currentName,
++	const char* newName)
++{
++	if (currentPlugged || currentName == NULL || newName == NULL)
++		return false;
++	return strcmp(currentName, newName) == 0;
++}
++
++
++#endif	// CAM_REPLUG_H
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index e0126de007..b5c2e85748 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -22,7 +22,9 @@
+ //XXX: change interface
+ #include <interface/Bitmap.h>
+ 
++#include "AddOn.h"
+ #include "CamDevice.h"
++#include "CamReplug.h"
+ #include "CamVideoSize.h"
+ #include "CamSensor.h"
+ 
+@@ -50,6 +52,11 @@
+ //#define FIELD_RATE 29.97f
+ #define FIELD_RATE 30.f
+ 
++// Sent to the control thread of the node by its own threads. Anyone may
++// write to the control port: the messages carry nothing to trust.
++static const int32 kMsgConsumerGone = 'Cgon';
++static const int32 kMsgCameraPluggedIn = 'Cplg';
++
+ 
+ int32 VideoProducer::fInstances = 0;
+ 
+@@ -99,6 +106,8 @@ VideoProducer::VideoProducer(
+ VideoProducer::~VideoProducer()
+ {
+ 	if (fInitStatus == B_OK) {
++		static_cast<WebCamMediaAddOn*>(fAddOn)->NodeDeleted(this);
++
+ 		/* Clean up after ourselves, in case the application didn't make us
+ 		 * do so. */
+ 		if (fConnected)
+@@ -128,9 +137,32 @@ VideoProducer::AddOn(int32 *internal_id) const
+ }
+ 
+ 
++void
++VideoProducer::CameraPluggedIn()
++{
++	// The control thread takes the camera: it is the one that starts and
++	// stops the stream.
++	write_port_etc(ControlPort(), kMsgCameraPluggedIn, NULL, 0,
++		B_RELATIVE_TIMEOUT, 0);
++}
++
++
+ status_t
+-VideoProducer::HandleMessage(int32 /*message*/, const void* /*data*/, size_t /*size*/)
++VideoProducer::HandleMessage(int32 message, const void* /*data*/, size_t /*size*/)
+ {
++	switch (message) {
++		case kMsgConsumerGone:
++			// The application of the consumer has died without
++			// disconnecting, and nobody else tells us. Free the camera for
++			// the next application.
++			if (fConnected)
++				Disconnect(fOutput.source, fOutput.destination);
++			return B_OK;
++
++		case kMsgCameraPluggedIn:
++			_TakeCameraBack();
++			return B_OK;
++	}
+ 	return B_ERROR;
+ }
+ 
+@@ -169,6 +201,12 @@ VideoProducer::NodeRegistered()
+ 		return;
+ 	}
+ 
++	// Create the time source object while the media server is still there.
++	// BMediaEventLooper::ControlLoop() uses TimeSource() without a NULL check;
++	// created only at shutdown, when the add-on server stops the node after
++	// the media server has quit, it is NULL and the control thread crashes.
++	TimeSource();
++
+ 	/* Set up the parameter web */
+ 
+ 	//TODO: remove and put sensible stuff there
+@@ -577,6 +615,15 @@ VideoProducer::Connect(status_t error, const media_source &source,
+ 		return;
+ 	}
+ 
++	// The camera streams the size of this connection. Another format
++	// proposal since PrepareToConnect() may have chosen a different one.
++	uint32 width = format.u.raw_video.display.line_width;
++	uint32 height = format.u.raw_video.display.line_count;
++	if (fCamDevice->AcceptVideoFrame(width, height) != B_OK) {
++		PRINTF(0, ("Connect: The camera does not offer that size\n"));
++		return;
++	}
++
+ 	// 4 * width * height below must not overflow.
+ 	if (!cam_video_size_allowed(format.u.raw_video.display.line_width,
+ 			format.u.raw_video.display.line_count)) {
+@@ -868,6 +915,37 @@ VideoProducer::_GetResolution(bigtime_t* lastChange, void* value, size_t* size)
+ }
+ 
+ 
++/*!	Streams from the camera again after it has been unplugged and plugged in
++	again. The camera that went away stays as it is: nothing deletes it.
++*/
++void
++VideoProducer::_TakeCameraBack()
++{
++	const char* name = fCamDevice->FlavorInfo()->name;
++	CamDevice* camera
++		= static_cast<WebCamMediaAddOn*>(fAddOn)->PluggedCameraNamed(name);
++	if (camera == NULL || !cam_takes_over(fCamDevice->IsPlugged(), name,
++			camera->FlavorInfo()->name)) {
++		return;
++	}
++
++	const bool wasRunning = fRunning;
++	if (wasRunning)
++		HandleStop();
++
++	fCamDevice = camera;
++	if (fConnected) {
++		uint32 width = fConnectedFormat.display.line_width;
++		uint32 height = fConnectedFormat.display.line_count;
++		if (fCamDevice->AcceptVideoFrame(width, height) != B_OK)
++			PRINTF(-1, ("_TakeCameraBack: The camera lacks that size\n"));
++	}
++
++	if (wasRunning)
++		HandleStart(TimeSource()->Now());
++}
++
++
+ /*!	Takes the size for the next connection that does not ask for one. The
+ 	running stream is left alone; the value comes from outside and is checked
+ 	against the camera's list.
+@@ -1150,12 +1228,21 @@ VideoProducer::FrameGenerator()
+ 
+ 		PRINTF(1, ("FrameGenerator: SendBuffer...\n"));
+ 		/* Send the buffer on down to the consumer */
+-		if (SendBuffer(buffer, fOutput.source, fOutput.destination) < B_OK) {
++		status_t status = SendBuffer(buffer, fOutput.source,
++			fOutput.destination);
++		if (status < B_OK) {
+ 			PRINTF(-1, ("FrameGenerator: Error sending buffer\n"));
+ 			/* If there is a problem sending the buffer, return it to its
+ 			 * buffer group. */
+ 			buffer->Recycle();
+ 		}
++		if (status == B_BAD_PORT_ID) {
++			// Only the control thread may disconnect: it waits for this
++			// thread. Stop sending until it has done so.
++			if (write_port_etc(ControlPort(), kMsgConsumerGone, NULL, 0,
++					B_RELATIVE_TIMEOUT, 0) == B_OK)
++				fEnabled = false;
++		}
+ 
+ 		_UpdateStats();
+ 	}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+index 6434cd9552..fc31d5f374 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.h
+@@ -32,6 +32,9 @@ virtual					~VideoProducer();
+ 
+ virtual	status_t		InitCheck() const { return fInitStatus; }
+ 
++		// May be called from any thread; does not block.
++		void				CameraPluggedIn();
++
+ 
+ /* BMediaNode */
+ public:
+@@ -122,6 +125,7 @@ private:
+ 		status_t			_GetResolution(bigtime_t* lastChange, void* value,
+ 								size_t* size);
+ 		status_t			_SetResolution(const void* value, size_t size);
++		void				_TakeCameraBack();
+ 
+ static	int32				fInstances;
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 37f371d88b..722f0890db 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -11,6 +11,7 @@
+ #include "UVCControls.h"
+ #include "UVCDeframer.h"
+ 
++#include <Autolock.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -87,7 +88,8 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fHeaderDescriptor(NULL),
+ 	fInterruptIn(NULL),
+ 	fParsedFormatIndex(0),
+-	fParsedFormat(kFormatNone)
++	fParsedFormat(kFormatNone),
++	fIdleThread(-1)
+ {
+ 	uvc_frame_list_init(&fFrames);
+ 	memset(&fFrame, 0, sizeof(fFrame));
+@@ -187,6 +189,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 
+ UVCCamDevice::~UVCCamDevice()
+ {
++	_WaitForIdleSwitch();
+ 	free(fHeaderDescriptor);
+ }
+ 
+@@ -610,6 +613,9 @@ UVCCamDevice::SupportsIsochronous()
+ status_t
+ UVCCamDevice::StartTransfer()
+ {
++	_WaitForIdleSwitch();
++	if (!IsPlugged())
++		return B_DEV_NOT_READY;
+ 	if (fFrame.compressed && !fJpegDecoder.InitCheck())
+ 		return B_NO_MEMORY;
+ 	if (_ProbeCommitFormat() != B_OK)
+@@ -621,7 +627,7 @@ UVCCamDevice::StartTransfer()
+ 	if (status == B_OK)
+ 		status = CamDevice::StartTransfer();
+ 	if (status != B_OK)
+-		_SelectIdleAlternate();
++		_StartIdleSwitch();
+ 	return status;
+ }
+ 
+@@ -633,26 +639,40 @@ UVCCamDevice::StopTransfer()
+ 	// Switching to the idle setting first leaves them waiting for data that
+ 	// never comes, and the data pumps cannot be joined.
+ 	status_t status = CamDevice::StopTransfer();
+-	_SelectIdleAlternate();
++	_StartIdleSwitch();
+ 	return status;
+ }
+ 
+ 
++void
++UVCCamDevice::Unplugged()
++{
++	// The BUSBDevice is deleted after this call, and the idle switch may
++	// still use it.
++	CamDevice::Unplugged();
++	BAutolock lock(Locker());
++	_WaitForIdleSwitch();
++}
++
++
++/*!	Only a suggestion: the size the camera streams stays as it is. Reading
++	the resolution parameter during a stream ends up here.
++*/
+ status_t
+ UVCCamDevice::SuggestVideoFrame(uint32& width, uint32& height)
+ {
+-	printf("UVCCamDevice::SuggestVideoFrame(%" B_PRIu32 ", %" B_PRIu32 ")\n", width, height);
+ 	// 640x480 is a size every UVC camera offers and 30 frames per second fit
+ 	// the bandwidth of a high speed endpoint. If the camera does not have it,
+ 	// take the smallest size it offers.
+-	width = 640;
+-	height = 480;
+-	if (AcceptVideoFrame(width, height) != B_OK) {
+-		if (fFrames.count == 0)
+-			return B_ERROR;
+-		width = fFrames.frames[0].width;
+-		height = fFrames.frames[0].height;
++	if (uvc_frame_list_find(&fFrames, 640, 480) != NULL) {
++		width = 640;
++		height = 480;
++		return B_OK;
+ 	}
++	if (fFrames.count == 0)
++		return B_ERROR;
++	width = fFrames.frames[0].width;
++	height = fFrames.frames[0].height;
+ 	return B_OK;
+ }
+ 
+@@ -678,15 +698,22 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ 	}
+ 
+ 	const uvc_frame* frame = uvc_frame_list_find(&fFrames, width, height);
+-	if (frame != NULL) {
+-		fFrame = *frame;
+-		SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+-		return B_OK;
++	if (frame == NULL) {
++		fprintf(stderr, "UVCCamDevice::AcceptVideoFrame() Invalid frame"
++			" dimensions\n");
++		return B_ERROR;
+ 	}
+ 
+-	fprintf(stderr, "UVCCamDevice::AcceptVideoFrame() Invalid frame dimensions"
+-		"\n");
+-	return B_ERROR;
++	// A format proposal may come during a stream. The camera was told the
++	// size at the start, and the frame generator reads it without a lock:
++	// the size is only taken while nothing streams.
++	BAutolock lock(Locker());
++	if (TransferEnabled())
++		return B_OK;
++
++	fFrame = *frame;
++	SetVideoFrame(BRect(0, 0, width - 1, height - 1));
++	return B_OK;
+ }
+ 
+ 
+@@ -890,8 +917,12 @@ UVCCamDevice::_DefaultFrameInterval() const
+ status_t
+ UVCCamDevice::_SelectIdleAlternate()
+ {
+-	printf("UVCCamDevice::_SelectIdleAlternate()\n");
+-	const BUSBConfiguration* config = fDevice->ActiveConfiguration();
++	// Runs in a thread of its own: Unplugged() may forget the device
++	// meanwhile, and deletes it only after this thread has ended.
++	BUSBDevice* device = fDevice;
++	if (device == NULL)
++		return B_NO_INIT;
++	const BUSBConfiguration* config = device->ActiveConfiguration();
+ 	const BUSBInterface* streaming = config->InterfaceAt(fStreamingIndex);
+ 	if (streaming == NULL)
+ 		return B_BAD_INDEX;
+@@ -907,6 +938,47 @@ UVCCamDevice::_SelectIdleAlternate()
+ }
+ 
+ 
++/*!	Switches the streaming interface to its idle setting in a thread of its
++	own. Some cameras take seconds to answer that request after they have
++	streamed (the C920 about two), and the application that stops the stream
++	should not wait for it. Whoever uses the interface next waits for the
++	thread with _WaitForIdleSwitch().
++*/
++void
++UVCCamDevice::_StartIdleSwitch()
++{
++	_WaitForIdleSwitch();
++
++	fIdleThread = spawn_thread(_IdleSwitchThread, "UVC idle alternate",
++		B_NORMAL_PRIORITY, this);
++	if (fIdleThread < B_OK) {
++		fIdleThread = -1;
++		_SelectIdleAlternate();
++		return;
++	}
++	resume_thread(fIdleThread);
++}
++
++
++void
++UVCCamDevice::_WaitForIdleSwitch()
++{
++	if (fIdleThread < 0)
++		return;
++
++	status_t result;
++	wait_for_thread(fIdleThread, &result);
++	fIdleThread = -1;
++}
++
++
++/*static*/ status_t
++UVCCamDevice::_IdleSwitchThread(void* data)
++{
++	return ((UVCCamDevice*)data)->_SelectIdleAlternate();
++}
++
++
+ struct ParameterLayout {
+ 	const char*	group;
+ 	const char*	name;
+@@ -1063,6 +1135,10 @@ UVCCamDevice::_DefineControls()
+ bool
+ UVCCamDevice::_ReadControl(const UVCControl& control, uint8 request, uint8* data)
+ {
++	// An application may still show the controls of an unplugged camera.
++	BAutolock lock(Locker());
++	if (!IsPlugged())
++		return false;
+ 	ssize_t transferred = fDevice->ControlTransfer(USB_REQTYPE_CLASS
+ 		| USB_REQTYPE_INTERFACE_IN, request, control.selector << 8,
+ 		control.requestIndex, control.length, data);
+@@ -1167,6 +1243,9 @@ UVCCamDevice::_WriteControl(int32 parameter)
+ 	} else
+ 		uvc_encode_value(control.value, length, data);
+ 
++	BAutolock lock(Locker());
++	if (!IsPlugged())
++		return B_DEV_NOT_READY;
+ 	ssize_t transferred = fDevice->ControlTransfer(USB_REQTYPE_CLASS
+ 		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, control.selector << 8,
+ 		control.requestIndex, length, data);
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 3c743b044e..cf61d51e8b 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -28,6 +28,7 @@ public:
+ 	virtual bool				SupportsIsochronous();
+ 	virtual status_t			StartTransfer();
+ 	virtual status_t			StopTransfer();
++	virtual	void				Unplugged();
+ 	virtual status_t			SuggestVideoFrame(uint32 &width,
+ 									uint32 &height);
+ 	virtual status_t			AcceptVideoFrame(uint32 &width,
+@@ -63,6 +64,9 @@ private:
+ 			status_t			_ResetDeframer();
+ 			uint32				_DefaultFrameInterval() const;
+ 			status_t			_SelectIdleAlternate();
++			void				_StartIdleSwitch();
++			void				_WaitForIdleSwitch();
++	static	status_t			_IdleSwitchThread(void* data);
+ 
+ 			void				_DefineControl(int32 parameter,
+ 									UVCControlKind kind, uint8 selector,
+@@ -102,6 +106,8 @@ private:
+ 			uint8				fCameraControls;
+ 			uint8				fProcessingControls[2];
+ 			UVCControl			fControls[kUvcParameterCount];
++
++			thread_id			fIdleThread;
+ };
+ 
+ 
+diff --git a/src/tests/add-ons/media/usb_webcam/CamReplugTest.cpp b/src/tests/add-ons/media/usb_webcam/CamReplugTest.cpp
+new file mode 100644
+index 0000000000..9ff14b120e
+--- /dev/null
++++ b/src/tests/add-ons/media/usb_webcam/CamReplugTest.cpp
+@@ -0,0 +1,77 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "CamReplug.h"
++
++#include <stdio.h>
++
++
++static int sFailures = 0;
++static int sTests = 0;
++
++
++#define CHECK(condition) \
++	do { \
++		if (!(condition)) { \
++			printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++			sFailures++; \
++		} \
++	} while (0)
++
++
++static void
++test_same_camera_plugged_in_again_takes_over()
++{
++	CHECK(cam_takes_over(false, "HD Pro Webcam C920", "HD Pro Webcam C920"));
++}
++
++
++static void
++test_camera_that_still_works_is_kept()
++{
++	// A second camera of the same model must not steal a working stream.
++	CHECK(!cam_takes_over(true, "HD Pro Webcam C920", "HD Pro Webcam C920"));
++}
++
++
++static void
++test_other_camera_does_not_take_over()
++{
++	// The application chose that camera; another one is not what it asked for.
++	CHECK(!cam_takes_over(false, "HD Pro Webcam C920", "Integrated Camera"));
++}
++
++
++static void
++test_missing_names_never_match()
++{
++	CHECK(!cam_takes_over(false, NULL, "HD Pro Webcam C920"));
++	CHECK(!cam_takes_over(false, "HD Pro Webcam C920", NULL));
++	CHECK(!cam_takes_over(false, NULL, NULL));
++}
++
++
++#define RUN(test) \
++	do { \
++		sTests++; \
++		int before = sFailures; \
++		test(); \
++		printf("%s %s\n", sFailures == before ? "ok    " : "FAILED", #test); \
++	} while (0)
++
++
++int
++main()
++{
++	RUN(test_same_camera_plugged_in_again_takes_over);
++	RUN(test_camera_that_still_works_is_kept);
++	RUN(test_other_camera_does_not_take_over);
++	RUN(test_missing_names_never_match);
++	printf("%d tests, %d failures\n", sTests, sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/add-ons/media/usb_webcam/Jamfile b/src/tests/add-ons/media/usb_webcam/Jamfile
+index de2b605ed9..9a538a3052 100644
+--- a/src/tests/add-ons/media/usb_webcam/Jamfile
++++ b/src/tests/add-ons/media/usb_webcam/Jamfile
+@@ -4,6 +4,7 @@ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons media media-add-ons usb_webcam addons uvc ;
+ 
+ SimpleTest CamDeviceNameTest : CamDeviceNameTest.cpp ;
++SimpleTest CamReplugTest : CamReplugTest.cpp ;
+ SimpleTest CamVideoSizeTest : CamVideoSizeTest.cpp ;
+ SimpleTest UVCColorBenchmark : UVCColorBenchmark.cpp ;
+ SimpleTest UVCColorTest : UVCColorTest.cpp ;
+diff --git a/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp b/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
+index 9ffe7d38df..416ff6da36 100644
+--- a/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
++++ b/src/tests/add-ons/media/usb_webcam/UVCColorBenchmark.cpp
+@@ -37,6 +37,12 @@ measure(int width, int height)
+ 	size_t outSize = (size_t)width * height * 4;
+ 	uint8_t* in = (uint8_t*)malloc(inSize);
+ 	uint8_t* out = (uint8_t*)malloc(outSize);
++	if (in == NULL || out == NULL) {
++		fprintf(stderr, "not enough memory for %dx%d\n", width, height);
++		free(in);
++		free(out);
++		return;
++	}
+ 	for (size_t i = 0; i < inSize; i++)
+ 		in[i] = (uint8_t)(i * 37 + 11);
+ 
+-- 
+2.54.1
+

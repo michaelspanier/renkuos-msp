@@ -1,0 +1,4671 @@
+From 4c5552e785afb86742535063a5ccd4f6d3d4ea8c Mon Sep 17 00:00:00 2001
+From: Michael Spanier <spanier.michael@gmail.com>
+Date: Sun, 22 Nov 2026 13:43:23 +0000
+Subject: [PATCH 27/43] apps: add Flick and Pegel
+
+Flick takes pictures with a webcam, Pegel shows the level of an audio input. Both were only loose programs on the test laptop so far.
+
+msp: not in any PR. Not yet added to the image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ data/catalogs/apps/flick/de.catkeys |   61 ++
+ src/apps/Jamfile                    |    2 +
+ src/apps/flick/Flick.cpp            |   78 ++
+ src/apps/flick/Flick.rdef           |   42 +
+ src/apps/flick/FlickCamera.cpp      |  332 ++++++++
+ src/apps/flick/FlickCamera.h        |   78 ++
+ src/apps/flick/FlickConsumer.cpp    |  243 ++++++
+ src/apps/flick/FlickConsumer.h      |   87 ++
+ src/apps/flick/FlickControls.cpp    |  384 +++++++++
+ src/apps/flick/FlickControls.h      |   58 ++
+ src/apps/flick/FlickControlsLogic.h |   82 ++
+ src/apps/flick/FlickIcons.cpp       |  111 +++
+ src/apps/flick/FlickIcons.h         |   29 +
+ src/apps/flick/FlickLogic.cpp       |  233 +++++
+ src/apps/flick/FlickLogic.h         |  110 +++
+ src/apps/flick/FlickWindow.cpp      | 1204 ++++++++++++++++++++++++++
+ src/apps/flick/FlickWindow.h        |   97 +++
+ src/apps/flick/Jamfile              |   22 +
+ src/apps/pegel/Jamfile              |    6 +
+ src/apps/pegel/Pegel.cpp            | 1225 +++++++++++++++++++++++++++
+ 20 files changed, 4484 insertions(+)
+ create mode 100644 data/catalogs/apps/flick/de.catkeys
+ create mode 100644 src/apps/flick/Flick.cpp
+ create mode 100644 src/apps/flick/Flick.rdef
+ create mode 100644 src/apps/flick/FlickCamera.cpp
+ create mode 100644 src/apps/flick/FlickCamera.h
+ create mode 100644 src/apps/flick/FlickConsumer.cpp
+ create mode 100644 src/apps/flick/FlickConsumer.h
+ create mode 100644 src/apps/flick/FlickControls.cpp
+ create mode 100644 src/apps/flick/FlickControls.h
+ create mode 100644 src/apps/flick/FlickControlsLogic.h
+ create mode 100644 src/apps/flick/FlickIcons.cpp
+ create mode 100644 src/apps/flick/FlickIcons.h
+ create mode 100644 src/apps/flick/FlickLogic.cpp
+ create mode 100644 src/apps/flick/FlickLogic.h
+ create mode 100644 src/apps/flick/FlickWindow.cpp
+ create mode 100644 src/apps/flick/FlickWindow.h
+ create mode 100644 src/apps/flick/Jamfile
+ create mode 100644 src/apps/pegel/Jamfile
+ create mode 100644 src/apps/pegel/Pegel.cpp
+
+diff --git a/data/catalogs/apps/flick/de.catkeys b/data/catalogs/apps/flick/de.catkeys
+new file mode 100644
+index 0000000000..7925bca939
+--- /dev/null
++++ b/data/catalogs/apps/flick/de.catkeys
+@@ -0,0 +1,61 @@
++1	german	x-vnd.Flick	2691601451
++Exposure Time	FlickControls		Belichtungszeit
++WB Red	FlickControls		Rot
++Image settings…	FlickWindow		Bildeinstellungen…
++Take a photo (Space)	FlickWindow		Foto aufnehmen (Leertaste)
++Allow Lower Frame Rate	FlickControls		Niedrigere Bildrate erlauben
++Sharpness	FlickControls		Schärfe
++The photo cannot be saved	FlickWindow		Das Foto lässt sich nicht speichern
++Disconnect the camera and connect it again.	FlickWindow		Kamera abziehen und wieder anschließen.
++The camera reports no size	FlickWindow		Die Kamera meldet keine Größe
++Hue	FlickControls		Farbton
++Size	FlickWindow		Größe
++60 Hz	FlickControls		60 Hz
++Desktop not found	FlickWindow		Desktop nicht gefunden
++About Flick…	FlickWindow		Über Flick…
++Flick	System name		Flick
++Image settings	FlickControls		Bildeinstellungen
++Connect a camera and start Flick again.	FlickWindow		Eine Kamera anschließen und Flick neu starten.
++View	FlickWindow		Ansicht
++Not enough memory	FlickWindow		Zu wenig Speicher
++Camera	FlickWindow		Kamera
++Off	FlickControls		Aus
++Gain	FlickControls		Verstärkung
++Show frame rate	FlickWindow		Bildrate anzeigen
++The camera cannot be started	FlickWindow		Die Kamera lässt sich nicht starten
++PNG image	FlickWindow		PNG-Bild
++Saturation	FlickControls		Sättigung
++Take photo	FlickWindow		Foto aufnehmen
++Power Line Frequency	FlickControls		Netzfrequenz
++No camera found	FlickWindow		Keine Kamera gefunden
++This camera has no picture settings	FlickWindow		Diese Kamera hat keine Bildeinstellungen
++White Balance Component	FlickControls		Weißabgleich (Farbkanäle)
++Exposure	FlickControls		Belichtung
++Contrast	FlickControls		Kontrast
++Opening the camera…	FlickWindow		Kamera wird geöffnet…
++File	FlickWindow		Datei
++Quit	FlickWindow		Beenden
++Try another camera.	FlickWindow		Eine andere Kamera ausprobieren.
++Is another program using it?	FlickWindow		Wird sie von einem anderen Programm benutzt?
++Backlight Compensation	FlickControls		Gegenlichtausgleich
++WB Blue	FlickControls		Blau
++Brightness	FlickControls		Helligkeit
++The camera cannot be opened	FlickWindow		Die Kamera lässt sich nicht öffnen
++Looking for a camera…	FlickWindow		Kamera wird gesucht…
++50 Hz	FlickControls		50 Hz
++WB Temperature	FlickControls		Farbtemperatur
++Waiting for the picture…	FlickWindow		Warten auf das Bild…
++Flick - pictures with a click.\n\nThe photo lands on the Desktop as a PNG file, or can be dragged straight into any folder.	Flick	Flick and click rhyme on purpose. Please keep a rhyme or a pun with the name if your language allows it.	Flick – Bilder mit einem Klick.\n\nDas Foto landet als PNG auf dem Desktop oder lässt sich direkt in einen Ordner ziehen.
++Gamma	FlickControls		Gamma
++Photo saved	FlickWindow		Foto gespeichert
++Auto	FlickControls		Automatisch
++White Balance Temperature	FlickControls		Weißabgleich (Temperatur)
++Frequency	FlickControls		Frequenz
++%rate% frames/s	FlickWindow		%rate% Bilder/s
++Image settings (Alt-I)	FlickWindow		Bildeinstellungen (Alt+I)
++Mirror picture	FlickWindow		Bild spiegeln
++Mirror the picture (Alt-M)	FlickWindow		Bild spiegeln (Alt+M)
++No camera	FlickWindow		Keine Kamera
++Self-timer	FlickWindow		Selbstauslöser
++Self-timer: 3 seconds (Alt-T)	FlickWindow		Selbstauslöser: 3 Sekunden (Alt+T)
++uncompressed	FlickWindow		unkomprimiert
+diff --git a/src/apps/Jamfile b/src/apps/Jamfile
+index c883cf7b07..e3b323d0ce 100644
+--- a/src/apps/Jamfile
++++ b/src/apps/Jamfile
+@@ -7,6 +7,7 @@ HaikuSubInclude bootmanager ;
+ HaikuSubInclude charactermap ;
+ HaikuSubInclude clock ;
+ HaikuSubInclude codycam ;
++HaikuSubInclude flick ;
+ HaikuSubInclude cortex ;
+ HaikuSubInclude debuganalyzer ;
+ HaikuSubInclude debugger ;
+@@ -32,6 +33,7 @@ HaikuSubInclude mail ;
+ HaikuSubInclude mandelbrot ;
+ HaikuSubInclude mediaconverter ;
+ HaikuSubInclude mediaplayer ;
++HaikuSubInclude pegel ;
+ HaikuSubInclude midiplayer ;
+ HaikuSubInclude musiccollection ;
+ HaikuSubInclude networkstatus ;
+diff --git a/src/apps/flick/Flick.cpp b/src/apps/flick/Flick.cpp
+new file mode 100644
+index 0000000000..29dca5308e
+--- /dev/null
++++ b/src/apps/flick/Flick.cpp
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include <AboutWindow.h>
++#include <Application.h>
++#include <Catalog.h>
++
++#include <stdio.h>
++#include <string.h>
++
++#include "FlickWindow.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "Flick"
++
++
++class FlickApp : public BApplication {
++public:
++	FlickApp()
++		:
++		BApplication("application/x-vnd.Flick")
++	{
++	}
++
++	virtual void ArgvReceived(int32 argc, char** argv)
++	{
++		// "--size 640x480" starts with that size, if the camera has it.
++		for (int32 i = 1; i + 1 < argc; i++) {
++			unsigned width, height;
++			if (strcmp(argv[i], "--size") == 0
++				&& sscanf(argv[i + 1], "%ux%u", &width, &height) == 2) {
++				fWidth = width;
++				fHeight = height;
++			}
++		}
++	}
++
++	virtual void AboutRequested()
++	{
++		BAboutWindow* about = new BAboutWindow(B_TRANSLATE_SYSTEM_NAME("Flick"),
++			"application/x-vnd.Flick");
++		about->AddDescription(B_TRANSLATE_COMMENT(
++			"Flick - pictures with a click.\n\n"
++			"The photo lands on the Desktop as a PNG file, or can be dragged "
++			"straight into any folder.",
++			"Flick and click rhyme on purpose. Please keep a rhyme or a pun "
++			"with the name if your language allows it."));
++		about->AddCopyright(2026, "Michael Spanier");
++		const char* authors[] = { "Michael Spanier", NULL };
++		about->AddAuthors(authors);
++		about->SetVersion("0.1");
++		about->Show();
++	}
++
++	virtual void ReadyToRun()
++	{
++		(new FlickWindow(fWidth, fHeight))->Show();
++	}
++
++private:
++	uint32	fWidth = 0;
++	uint32	fHeight = 0;
++};
++
++
++int
++main()
++{
++	FlickApp app;
++	app.Run();
++	return 0;
++}
+diff --git a/src/apps/flick/Flick.rdef b/src/apps/flick/Flick.rdef
+new file mode 100644
+index 0000000000..bf99e96026
+--- /dev/null
++++ b/src/apps/flick/Flick.rdef
+@@ -0,0 +1,42 @@
++resource app_signature "application/x-vnd.Flick";
++
++resource app_flags B_SINGLE_LAUNCH;
++
++resource app_version {
++	major  = 0,
++	middle = 1,
++	minor  = 0,
++
++	variety = B_APPV_DEVELOPMENT,
++	internal = 0,
++
++	short_info = "Flick",
++	long_info = "Flick, a simple camera app. Copyright 2026, Michael Spanier."
++};
++
++resource vector_icon {
++	$"6E6369660C0100000046020002020000003B0000BB000000000044000049C000"
++	$"00EE5242FFFFB01E24FF02000202398000B780003780003980004A70004B4800"
++	$"006E0E18FFFF962228FF020002023CA000378000B780003CA00049200048B000"
++	$"00FFA08AFFFFE85C4EFF02000202370000378000B780003700004960004A2800"
++	$"00FFFCE4FFFFC4BEAAFF01303034FF020002023900003A4000BA400039000047"
++	$"00004A600000ECECECFFFF5C5C60FF0201020339800000000000000039800046"
++	$"A0004A4800007896D2FF8C283868FFFF0E1022FF01FFFFFFBE015A1418FF0200"
++	$"02023800000000000000003800004A200048E00000FAFAFAFFFF96969AFF0100"
++	$"0000FF0E0A0440584E515C514F580A044058244A243240400A04405840404E39"
++	$"4E510A0440402432322B4E390A0438433E463E42383F0204BC5DC33CBC5DC15E"
++	$"BC5DC51B2F4DBAD8C5DEB71CC3FEB597BFDAB597C1B8B597BDFB2F3CB71CBD38"
++	$"BAD8BF18020436C38936C1AB36C567B861C53ABA3FC62AB683C44B254125C204"
++	$"25BE48B861BE74B683BD85BA3FBF640204BB2BC3D6BB2BC1F7BB2BC5B42CC587"
++	$"B9A6C677B5EAC497B465C072B465C251B465BE942CBEC1B5EABDD1B9A6BFB102"
++	$"04324932C20432C4A82C4CB91AC531B676C3DF264326C24426BFA02C40B676BF"
++	$"17B91AC0690204B78BC16CB78BC113B78BC1C6B6E845B741C1EBB68EC191B644"
++	$"C0C9B644C123B644C06FB6E8C078B68EC04BB741C0A4020446BCC346BC5346BD"
++	$"3342BD8FC16DBD8FBFABBD8F3EBCC33EBD333EBC5342BBF7BFABBBF7C16DBBF7"
++	$"0204463746BBBA46BC9A4239C16D39BFAB393E373EBC9A3EBBBA4235BFAB35C1"
++	$"6D350A064058244A2432322B4E394E510204BB2BC3D6BB2BC1F7BB2BC5B42CC5"
++	$"87B9A6C677B5EAC497B465C072B465C251B465BE942CBEC1B5EABDD1B9A6BFB1"
++	$"0E0A000100000A010101040A020102040A030103040A0401040818FF0A050105"
++	$"000A050106000A060107000A070108000A080109081EFF0A09010A0818FF0A0A"
++	$"010B0818FF0A0B010C1001178222040A0B010D1818FF0117812204"
++};
+diff --git a/src/apps/flick/FlickCamera.cpp b/src/apps/flick/FlickCamera.cpp
+new file mode 100644
+index 0000000000..a4cbbe4670
+--- /dev/null
++++ b/src/apps/flick/FlickCamera.cpp
+@@ -0,0 +1,332 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * Based on the node set up of CodyCam.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickCamera.h"
++
++#include <MediaRoster.h>
++#include <ParameterWeb.h>
++#include <TimeSource.h>
++#include <scheduler.h>
++
++#include <stdio.h>
++#include <string.h>
++
++#include "FlickConsumer.h"
++
++
++static const flick_size kCandidateSizes[] = {
++	{ 160, 120 }, { 320, 180 }, { 320, 240 }, { 352, 288 }, { 424, 240 },
++	{ 640, 360 }, { 640, 480 }, { 848, 480 }, { 960, 540 }, { 1280, 720 },
++};
++
++static const int kCandidateCount
++	= sizeof(kCandidateSizes) / sizeof(kCandidateSizes[0]);
++
++
++FlickCamera::FlickCamera(const BMessenger& target)
++	:
++	fRoster(NULL),
++	fConsumer(NULL),
++	fHasProducer(false),
++	fConnected(false),
++	fRunning(false)
++{
++	fRoster = BMediaRoster::Roster();
++	fConsumer = new FlickConsumer(target);
++	if (fRoster != NULL)
++		fRoster->RegisterNode(fConsumer);
++}
++
++
++FlickCamera::~FlickCamera()
++{
++	Close();
++	if (fRoster != NULL && fConsumer != NULL)
++		fRoster->ReleaseNode(fConsumer->Node());
++}
++
++
++/*static*/ void
++FlickCamera::List(std::vector<flick_camera_info>& cameras)
++{
++	cameras.clear();
++
++	BMediaRoster* roster = BMediaRoster::Roster();
++	if (roster == NULL)
++		return;
++
++	media_format format;
++	format.type = B_MEDIA_RAW_VIDEO;
++	format.u.raw_video = media_raw_video_format::wildcard;
++
++	const int32 kMax = 16;
++	dormant_node_info nodes[kMax];
++	int32 count = kMax;
++	if (roster->GetDormantNodes(nodes, &count, NULL, &format, NULL,
++			B_BUFFER_PRODUCER | B_PHYSICAL_INPUT) != B_OK) {
++		return;
++	}
++
++	for (int32 i = 0; i < count; i++) {
++		flick_camera_info info;
++		info.node = nodes[i];
++		strlcpy(info.name, nodes[i].name, sizeof(info.name));
++		cameras.push_back(info);
++	}
++}
++
++
++status_t
++FlickCamera::Open(const flick_camera_info& camera)
++{
++	Close();
++	if (fRoster == NULL)
++		return B_NO_INIT;
++
++	status_t status = fRoster->InstantiateDormantNode(camera.node, &fProducer);
++	if (status != B_OK) {
++		// A camera can only be taken once. If it is still there from an
++		// earlier run, use that node.
++		status = _FindLiveNode(camera);
++		if (status != B_OK)
++			return status;
++	}
++
++	fHasProducer = true;
++	return B_OK;
++}
++
++
++void
++FlickCamera::Close()
++{
++	Stop();
++	if (fHasProducer && fRoster != NULL)
++		fRoster->ReleaseNode(fProducer);
++	fHasProducer = false;
++}
++
++
++/*!	Asks the camera for its sizes. A camera node that publishes them as a
++	B_RESOLUTION parameter is taken by its word; for any other, the common
++	sizes are tried one by one.
++*/
++int
++FlickCamera::FindSizes(flick_size* sizes, int maxCount)
++{
++	int count = _SizesFromParameters(sizes, maxCount);
++	if (count == 0)
++		count = _SizesByTrying(sizes, maxCount);
++	return flick_sort_sizes(sizes, count);
++}
++
++
++int
++FlickCamera::_SizesFromParameters(flick_size* sizes, int maxCount)
++{
++	BParameterWeb* web = NULL;
++	if (fRoster->GetParameterWebFor(fProducer, &web) != B_OK || web == NULL)
++		return 0;
++
++	int count = 0;
++	BDiscreteParameter* resolution = _FindResolution(web);
++	for (int32 i = 0; resolution != NULL && i < resolution->CountItems()
++			&& count < maxCount; i++) {
++		flick_size& size = sizes[count];
++		if (flick_size_from_parameter(resolution->ItemValueAt(i), &size)) {
++			const char* name = resolution->ItemNameAt(i);
++			snprintf(size.name, sizeof(size.name), "%s",
++				name != NULL ? name : "");
++			count++;
++		}
++	}
++	delete web;
++	return count;
++}
++
++
++BDiscreteParameter*
++FlickCamera::_FindResolution(BParameterWeb* web)
++{
++	for (int32 i = 0; i < web->CountParameters(); i++) {
++		BParameter* parameter = web->ParameterAt(i);
++		if (parameter->Type() == BParameter::B_DISCRETE_PARAMETER
++			&& strcmp(parameter->Kind(), B_RESOLUTION) == 0) {
++			return static_cast<BDiscreteParameter*>(parameter);
++		}
++	}
++	return NULL;
++}
++
++
++int
++FlickCamera::_SizesByTrying(flick_size* sizes, int maxCount)
++{
++	int count = 0;
++	for (int i = 0; i < kCandidateCount && count < maxCount; i++) {
++		// A connection that the camera accepts is enough to know the size; it
++		// is taken down at once, nothing is started.
++		if (_Connect(kCandidateSizes[i].width, kCandidateSizes[i].height)
++				== B_OK) {
++			if (fConsumer->Width() == kCandidateSizes[i].width
++				&& fConsumer->Height() == kCandidateSizes[i].height) {
++				sizes[count++] = kCandidateSizes[i];
++			}
++			_Disconnect();
++		}
++	}
++	return count;
++}
++
++
++status_t
++FlickCamera::Start(uint32 width, uint32 height)
++{
++	Stop();
++	if (!fHasProducer)
++		return B_NO_INIT;
++
++	status_t status = _Connect(width, height);
++	if (status != B_OK)
++		return status;
++
++	media_node timeSourceNode;
++	status = fRoster->GetTimeSource(&timeSourceNode);
++	if (status != B_OK)
++		return status;
++
++	status = fRoster->SetTimeSourceFor(fProducer.node, timeSourceNode.node);
++	if (status != B_OK)
++		return status;
++	status = fRoster->SetTimeSourceFor(fConsumer->ID(), timeSourceNode.node);
++	if (status != B_OK)
++		return status;
++
++	bigtime_t latency = 0;
++	fRoster->GetLatencyFor(fProducer, &latency);
++	fRoster->SetProducerRunModeDelay(fProducer, latency);
++
++	bigtime_t initialLatency = 0;
++	if (fRoster->GetInitialLatencyFor(fProducer, &initialLatency) < B_OK)
++		initialLatency = 0;
++	initialLatency += estimate_max_scheduling_latency();
++
++	BTimeSource* timeSource = fRoster->MakeTimeSourceFor(fProducer);
++	if (timeSource == NULL)
++		return B_ERROR;
++
++	// Without a sound card the system time source may not run.
++	bigtime_t real = BTimeSource::RealTime();
++	if (!timeSource->IsRunning()) {
++		fRoster->StartTimeSource(timeSourceNode, real);
++		fRoster->SeekTimeSource(timeSourceNode, 0, real);
++	}
++	bigtime_t performance
++		= timeSource->PerformanceTimeFor(real + latency + initialLatency);
++	timeSource->Release();
++
++	status = fRoster->StartNode(fProducer, performance);
++	if (status != B_OK)
++		return status;
++	status = fRoster->StartNode(fConsumer->Node(), performance);
++	if (status != B_OK)
++		return status;
++
++	fRunning = true;
++	return B_OK;
++}
++
++
++void
++FlickCamera::Stop()
++{
++	if (fRoster == NULL)
++		return;
++
++	if (fRunning)
++		fRoster->StopNode(fConsumer->Node(), 0, true);
++	fRunning = false;
++	_Disconnect();
++}
++
++
++status_t
++FlickCamera::_FindLiveNode(const flick_camera_info& camera)
++{
++	const int32 kMax = 32;
++	live_node_info nodes[kMax];
++	int32 count = kMax;
++	if (fRoster->GetLiveNodes(nodes, &count) != B_OK)
++		return B_ERROR;
++
++	for (int32 i = 0; i < count; i++) {
++		fprintf(stderr, "Flick: live node %d \"%s\" (looking for \"%s\")\n",
++			(int)i, nodes[i].name, camera.name);
++		// Compare the add-on and flavor, not the name: the microphone of a
++		// camera often has the same name as the camera.
++		dormant_node_info dormant;
++		if (fRoster->GetDormantNodeFor(nodes[i].node, &dormant) == B_OK
++			&& dormant.addon == camera.node.addon
++			&& dormant.flavor_id == camera.node.flavor_id) {
++			return fRoster->GetNodeFor(nodes[i].node.node, &fProducer);
++		}
++	}
++	fprintf(stderr, "Flick: no live node found (%d nodes)\n", (int)count);
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++status_t
++FlickCamera::_Connect(uint32 width, uint32 height)
++{
++	if (!fHasProducer || fRoster == NULL)
++		return B_NO_INIT;
++	if (fConnected)
++		_Disconnect();
++
++	int32 count = 0;
++	status_t status = fRoster->GetFreeOutputsFor(fProducer, &fOutput, 1,
++		&count, B_MEDIA_RAW_VIDEO);
++	if (status != B_OK || count < 1)
++		return B_RESOURCE_UNAVAILABLE;
++
++	count = 0;
++	status = fRoster->GetFreeInputsFor(fConsumer->Node(), &fInput, 1, &count,
++		B_MEDIA_RAW_VIDEO);
++	if (status != B_OK || count < 1)
++		return B_RESOURCE_UNAVAILABLE;
++
++	media_format format;
++	format.type = B_MEDIA_RAW_VIDEO;
++	format.u.raw_video = media_raw_video_format::wildcard;
++	format.u.raw_video.display.format = B_RGB32;
++	format.u.raw_video.display.line_width = width;
++	format.u.raw_video.display.line_count = height;
++
++	status = fRoster->Connect(fOutput.source, fInput.destination, &format,
++		&fOutput, &fInput);
++	if (status != B_OK)
++		return status;
++
++	fConnected = true;
++	return B_OK;
++}
++
++
++void
++FlickCamera::_Disconnect()
++{
++	if (!fConnected || fRoster == NULL)
++		return;
++
++	fRoster->Disconnect(fOutput.node.node, fOutput.source,
++		fInput.node.node, fInput.destination);
++	fConnected = false;
++}
+diff --git a/src/apps/flick/FlickCamera.h b/src/apps/flick/FlickCamera.h
+new file mode 100644
+index 0000000000..498b9fd08b
+--- /dev/null
++++ b/src/apps/flick/FlickCamera.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_CAMERA_H
++#define FLICK_CAMERA_H
++
++
++#include <MediaAddOn.h>
++#include <MediaDefs.h>
++#include <MediaNode.h>
++#include <MediaRoster.h>
++#include <Messenger.h>
++
++#include <vector>
++
++#include "FlickLogic.h"
++
++class BDiscreteParameter;
++class BParameterWeb;
++class FlickConsumer;
++
++
++struct flick_camera_info {
++			dormant_node_info	node;
++			char				name[B_MEDIA_NAME_LENGTH];
++};
++
++
++/*!	One camera of the system, connected to our consumer. All calls come from
++	the window thread.
++*/
++class FlickCamera {
++public:
++								FlickCamera(const BMessenger& target);
++								~FlickCamera();
++
++	//! Lists the cameras (video sources) the media server knows.
++	static	void				List(std::vector<flick_camera_info>& cameras);
++
++			status_t			Open(const flick_camera_info& camera);
++			void				Close();
++
++	//! Sizes the camera takes, found by trying the usual ones.
++			int					FindSizes(flick_size* sizes, int maxCount);
++
++			status_t			Start(uint32 width, uint32 height);
++			void				Stop();
++			bool				IsRunning() const { return fRunning; }
++
++			FlickConsumer*		Consumer() const { return fConsumer; }
++
++	//! The camera node, for programs that show its parameters.
++			bool				HasProducer() const { return fHasProducer; }
++			media_node			Producer() const { return fProducer; }
++
++private:
++			status_t			_FindLiveNode(const flick_camera_info& camera);
++			status_t			_Connect(uint32 width, uint32 height);
++			int					_SizesFromParameters(flick_size* sizes, int maxCount);
++			int					_SizesByTrying(flick_size* sizes, int maxCount);
++	static	BDiscreteParameter*	_FindResolution(BParameterWeb* web);
++			void				_Disconnect();
++
++			BMediaRoster*		fRoster;
++			FlickConsumer*		fConsumer;
++			media_node			fProducer;
++			bool				fHasProducer;
++			media_output		fOutput;
++			media_input			fInput;
++			bool				fConnected;
++			bool				fRunning;
++};
++
++
++#endif	// FLICK_CAMERA_H
+diff --git a/src/apps/flick/FlickConsumer.cpp b/src/apps/flick/FlickConsumer.cpp
+new file mode 100644
+index 0000000000..1a9e68443e
+--- /dev/null
++++ b/src/apps/flick/FlickConsumer.cpp
+@@ -0,0 +1,243 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * Based on the VideoConsumer of CodyCam.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickConsumer.h"
++
++#include <Autolock.h>
++#include <Buffer.h>
++#include <MediaDefs.h>
++#include <OS.h>
++#include <TimeSource.h>
++
++#include <stdio.h>
++#include <string.h>
++
++
++FlickConsumer::FlickConsumer(const BMessenger& target)
++	:
++	BMediaNode("Flick"),
++	BMediaEventLooper(),
++	BBufferConsumer(B_MEDIA_RAW_VIDEO),
++	fTarget(target),
++	fLock("flick frame"),
++	fFrame(NULL),
++	fWidth(0),
++	fHeight(0),
++	fHasFrame(false),
++	fConnected(false),
++	fFramePending(0)
++{
++	AddNodeKind(B_PHYSICAL_OUTPUT);
++	SetEventLatency(0);
++	SetPriority(B_DISPLAY_PRIORITY);
++}
++
++
++FlickConsumer::~FlickConsumer()
++{
++	Quit();
++	delete fFrame;
++}
++
++
++bool
++FlickConsumer::CopyFrame(BBitmap* bitmap)
++{
++	BAutolock locker(fLock);
++	// The next frame may announce itself again even when this one cannot be
++	// shown, for example while the size changes. Otherwise no message would
++	// ever come again and the picture would stay frozen.
++	atomic_set(&fFramePending, 0);
++	if (fFrame == NULL || !fHasFrame || bitmap == NULL
++		|| bitmap->BitsLength() != fFrame->BitsLength()) {
++		return false;
++	}
++
++	memcpy(bitmap->Bits(), fFrame->Bits(), fFrame->BitsLength());
++	return true;
++}
++
++
++BMediaAddOn*
++FlickConsumer::AddOn(int32* cookie) const
++{
++	*cookie = 0;
++	return NULL;
++}
++
++
++void
++FlickConsumer::NodeRegistered()
++{
++	fInput.destination.port = ControlPort();
++	fInput.destination.id = 0;
++	fInput.source = media_source::null;
++	fInput.format.type = B_MEDIA_RAW_VIDEO;
++	fInput.format.u.raw_video = media_raw_video_format::wildcard;
++	fInput.node = Node();
++	strlcpy(fInput.name, "Flick video", sizeof(fInput.name));
++
++	Run();
++}
++
++
++void
++FlickConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
++	bool realTimeEvent)
++{
++	// Buffers are shown as soon as they arrive, see BufferReceived().
++}
++
++
++status_t
++FlickConsumer::AcceptFormat(const media_destination& dest,
++	media_format* format)
++{
++	if (dest != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	if (format->type == B_MEDIA_NO_TYPE)
++		format->type = B_MEDIA_RAW_VIDEO;
++	if (format->type != B_MEDIA_RAW_VIDEO)
++		return B_MEDIA_BAD_FORMAT;
++
++	color_space space = format->u.raw_video.display.format;
++	if (space == media_raw_video_format::wildcard.display.format)
++		format->u.raw_video.display.format = B_RGB32;
++	else if (space != B_RGB32)
++		return B_MEDIA_BAD_FORMAT;
++
++	return B_OK;
++}
++
++
++status_t
++FlickConsumer::GetNextInput(int32* cookie, media_input* input)
++{
++	if (*cookie != 0)
++		return B_BAD_INDEX;
++
++	*input = fInput;
++	*cookie = 1;
++	return B_OK;
++}
++
++
++void
++FlickConsumer::DisposeInputCookie(int32 cookie)
++{
++}
++
++
++void
++FlickConsumer::BufferReceived(BBuffer* buffer)
++{
++	bool use = false;
++	{
++		BAutolock locker(fLock);
++		if (fConnected && fFrame != NULL
++			&& RunState() == B_STARTED
++			&& buffer->SizeUsed() >= (size_t)fFrame->BitsLength()) {
++			memcpy(fFrame->Bits(), buffer->Data(), fFrame->BitsLength());
++			fHasFrame = true;
++			use = true;
++		}
++	}
++	buffer->Recycle();
++
++	// One message per frame that was not picked up, the view must not be
++	// flooded.
++	if (use && atomic_test_and_set(&fFramePending, 1, 0) == 0)
++		fTarget.SendMessage(kMsgFlickFrame);
++}
++
++
++void
++FlickConsumer::ProducerDataStatus(const media_destination& forWhom,
++	int32 status, bigtime_t atMediaTime)
++{
++}
++
++
++status_t
++FlickConsumer::GetLatencyFor(const media_destination& forWhom,
++	bigtime_t* latency, media_node_id* timeSource)
++{
++	if (forWhom != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	*latency = 20000;
++	*timeSource = TimeSource()->ID();
++	return B_OK;
++}
++
++
++status_t
++FlickConsumer::Connected(const media_source& producer,
++	const media_destination& where, const media_format& format,
++	media_input* input)
++{
++	fInput.source = producer;
++	fInput.format = format;
++	fInput.node = Node();
++	*input = fInput;
++
++	_SetFormat(format);
++	fConnected = true;
++	return B_OK;
++}
++
++
++void
++FlickConsumer::Disconnected(const media_source& producer,
++	const media_destination& where)
++{
++	if (where != fInput.destination || producer != fInput.source)
++		return;
++
++	BAutolock locker(fLock);
++	fConnected = false;
++	fHasFrame = false;
++	fInput.source = media_source::null;
++}
++
++
++status_t
++FlickConsumer::FormatChanged(const media_source& producer,
++	const media_destination& consumer, int32 fromChangeCount,
++	const media_format& format)
++{
++	if (consumer != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++	if (producer != fInput.source)
++		return B_MEDIA_BAD_SOURCE;
++
++	fInput.format = format;
++	_SetFormat(format);
++	return B_OK;
++}
++
++
++void
++FlickConsumer::_SetFormat(const media_format& format)
++{
++	BAutolock locker(fLock);
++
++	fWidth = format.u.raw_video.display.line_width;
++	fHeight = format.u.raw_video.display.line_count;
++	fHasFrame = false;
++
++	delete fFrame;
++	fFrame = new BBitmap(BRect(0, 0, fWidth - 1, fHeight - 1), B_RGB32);
++	if (fFrame->InitCheck() != B_OK) {
++		delete fFrame;
++		fFrame = NULL;
++	}
++}
+diff --git a/src/apps/flick/FlickConsumer.h b/src/apps/flick/FlickConsumer.h
+new file mode 100644
+index 0000000000..a016e745f9
+--- /dev/null
++++ b/src/apps/flick/FlickConsumer.h
+@@ -0,0 +1,87 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_CONSUMER_H
++#define FLICK_CONSUMER_H
++
++
++#include <Bitmap.h>
++#include <BufferConsumer.h>
++#include <Locker.h>
++#include <MediaEventLooper.h>
++#include <Messenger.h>
++
++
++/*!	Receives the video of a camera and keeps the newest frame. Each time a
++	frame arrives the target gets the message \c kMsgFlickFrame, at most one
++	per frame that was not picked up yet.
++*/
++class FlickConsumer : public BMediaEventLooper, public BBufferConsumer {
++public:
++								FlickConsumer(const BMessenger& target);
++	virtual						~FlickConsumer();
++
++	//! Copies the newest frame into \a bitmap, which must have the size of the
++	//! connection. Returns false if there is no frame.
++			bool				CopyFrame(BBitmap* bitmap);
++			uint32				Width() const { return fWidth; }
++			uint32				Height() const { return fHeight; }
++
++	// BMediaNode
++	virtual	BMediaAddOn*		AddOn(int32* cookie) const;
++
++protected:
++	virtual	void				NodeRegistered();
++
++	// BMediaEventLooper
++	virtual	void				HandleEvent(const media_timed_event* event,
++									bigtime_t lateness, bool realTimeEvent);
++
++	// BBufferConsumer
++public:
++	virtual	status_t			AcceptFormat(const media_destination& dest,
++									media_format* format);
++	virtual	status_t			GetNextInput(int32* cookie,
++									media_input* input);
++	virtual	void				DisposeInputCookie(int32 cookie);
++	virtual	void				BufferReceived(BBuffer* buffer);
++	virtual	void				ProducerDataStatus(
++									const media_destination& forWhom,
++									int32 status, bigtime_t atMediaTime);
++	virtual	status_t			GetLatencyFor(
++									const media_destination& forWhom,
++									bigtime_t* latency,
++									media_node_id* timeSource);
++	virtual	status_t			Connected(const media_source& producer,
++									const media_destination& where,
++									const media_format& format,
++									media_input* input);
++	virtual	void				Disconnected(const media_source& producer,
++									const media_destination& where);
++	virtual	status_t			FormatChanged(const media_source& producer,
++									const media_destination& consumer,
++									int32 fromChangeCount,
++									const media_format& format);
++
++private:
++			void				_SetFormat(const media_format& format);
++
++			BMessenger			fTarget;
++			media_input			fInput;
++			BLocker				fLock;
++			BBitmap*			fFrame;
++			uint32				fWidth;
++			uint32				fHeight;
++			bool				fHasFrame;
++			bool				fConnected;
++			int32				fFramePending;
++};
++
++
++const uint32 kMsgFlickFrame = 'FlFr';
++
++
++#endif	// FLICK_CONSUMER_H
+diff --git a/src/apps/flick/FlickControls.cpp b/src/apps/flick/FlickControls.cpp
+new file mode 100644
+index 0000000000..ecc07610f0
+--- /dev/null
++++ b/src/apps/flick/FlickControls.cpp
+@@ -0,0 +1,384 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickControls.h"
++
++#include <Box.h>
++#include <Catalog.h>
++#include <CheckBox.h>
++#include <LayoutBuilder.h>
++#include <MediaRoster.h>
++#include <MenuField.h>
++#include <MenuItem.h>
++#include <ParameterWeb.h>
++#include <PopUpMenu.h>
++#include <Screen.h>
++#include <ScrollView.h>
++#include <Slider.h>
++
++#include <stdio.h>
++#include <string.h>
++
++#include "FlickControlsLogic.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "FlickControls"
++
++
++static const uint32 kMsgSlider = 'FcSl';
++static const uint32 kMsgSwitch = 'FcSw';
++static const uint32 kMsgChoice = 'FcCh';
++static const uint32 kMsgControlsClosed = 'FcCl';
++
++
++/*!	The names of groups and parameters come from the camera and are English.
++	The ones we know are translated here.
++*/
++static const char* const kKnownNames[] = {
++	B_TRANSLATE_MARK("Brightness"),
++	B_TRANSLATE_MARK("Contrast"),
++	B_TRANSLATE_MARK("Hue"),
++	B_TRANSLATE_MARK("Saturation"),
++	B_TRANSLATE_MARK("Sharpness"),
++	B_TRANSLATE_MARK("Gamma"),
++	B_TRANSLATE_MARK("White Balance Temperature"),
++	B_TRANSLATE_MARK("WB Temperature"),
++	B_TRANSLATE_MARK("White Balance Component"),
++	B_TRANSLATE_MARK("WB Blue"),
++	B_TRANSLATE_MARK("WB Red"),
++	B_TRANSLATE_MARK("Backlight Compensation"),
++	B_TRANSLATE_MARK("Gain"),
++	B_TRANSLATE_MARK("Power Line Frequency"),
++	B_TRANSLATE_MARK("Frequency"),
++	B_TRANSLATE_MARK("Exposure"),
++	B_TRANSLATE_MARK("Exposure Time"),
++	B_TRANSLATE_MARK("Allow Lower Frame Rate"),
++	B_TRANSLATE_MARK("Auto"),
++	B_TRANSLATE_MARK("Off"),
++	B_TRANSLATE_MARK("50 Hz"),
++	B_TRANSLATE_MARK("60 Hz")
++};
++
++
++static const char*
++translated(const char* name)
++{
++	for (size_t i = 0; i < sizeof(kKnownNames) / sizeof(kKnownNames[0]); i++) {
++		if (strcmp(name, kKnownNames[i]) == 0)
++			return B_TRANSLATE_NOCOLLECT(kKnownNames[i]);
++	}
++	return name;
++}
++
++
++/*!	A slider that shows the value of the parameter, not its position. */
++class ValueSlider : public BSlider {
++public:
++	ValueSlider(const char* label, BMessage* message, int32 steps,
++			float minimum, float maximum)
++		:
++		BSlider(label, label, message, 0, steps, B_HORIZONTAL),
++		fMinimum(minimum),
++		fMaximum(maximum),
++		fSteps(steps)
++	{
++		fText[0] = '\0';
++	}
++
++	virtual const char* UpdateText() const
++	{
++		snprintf(fText, sizeof(fText), "%g",
++			flick_slider_value(Value(), fMinimum, fMaximum, fSteps));
++		return fText;
++	}
++
++private:
++	float			fMinimum;
++	float			fMaximum;
++	int32			fSteps;
++	mutable char	fText[32];
++};
++
++
++struct FlickControlEntry {
++	BParameter*		parameter;
++	BControl*		control;
++	int32			group;
++	float			minimum;
++	float			maximum;
++	int32			steps;
++	bool			isAutomatic;
++};
++
++
++FlickControlsWindow::FlickControlsWindow(const media_node& camera,
++	const BMessenger& owner)
++	:
++	BWindow(BRect(120, 120, 420, 400), B_TRANSLATE("Image settings"),
++		B_TITLED_WINDOW_LOOK, B_NORMAL_WINDOW_FEEL,
++		B_NOT_ZOOMABLE | B_AUTO_UPDATE_SIZE_LIMITS),
++	fWeb(NULL),
++	fCamera(camera),
++	fOwner(owner),
++	fStatus(B_ERROR),
++	fGroupCount(0)
++{
++	_Build();
++}
++
++
++FlickControlsWindow::~FlickControlsWindow()
++{
++	for (size_t i = 0; i < fEntries.size(); i++)
++		delete fEntries[i];
++	delete fWeb;
++}
++
++
++bool
++FlickControlsWindow::QuitRequested()
++{
++	fOwner.SendMessage(kMsgControlsClosed);
++	return true;
++}
++
++
++void
++FlickControlsWindow::_Build()
++{
++	BMediaRoster* roster = BMediaRoster::Roster();
++	if (roster == NULL
++		|| roster->GetParameterWebFor(fCamera, &fWeb) != B_OK || fWeb == NULL) {
++		return;
++	}
++
++	BGroupView* list = new BGroupView(B_VERTICAL, B_USE_DEFAULT_SPACING);
++	list->GroupLayout()->SetInsets(B_USE_WINDOW_INSETS);
++	BScrollView* scroll = new BScrollView("scroll", list, 0, false, true,
++		B_NO_BORDER);
++	BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
++		.Add(scroll);
++
++	// Tall enough to show most controls, but never taller than the screen.
++	float screenHeight = BScreen(this).Frame().Height();
++	float height = screenHeight - 160.0f;
++	if (height > 720.0f)
++		height = 720.0f;
++	scroll->SetExplicitMinSize(BSize(B_SIZE_UNSET, 160.0f));
++	scroll->SetExplicitPreferredSize(BSize(B_SIZE_UNSET, height));
++
++	// To the right of the picture, so that both can be seen.
++	BRect screen = BScreen(this).Frame();
++	ResizeTo(340.0f, height);
++	MoveTo(screen.right - 340.0f - 40.0f, screen.top + 60.0f);
++
++	for (int32 i = 0; i < fWeb->CountGroups(); i++)
++		_AddGroup(fWeb->GroupAt(i), list);
++
++	if (!fEntries.empty())
++		fStatus = B_OK;
++}
++
++
++/*!	Walks through the groups of the web. A group with parameters of its own
++	gets a box; the groups below it are searched as well.
++*/
++void
++FlickControlsWindow::_AddGroup(BParameterGroup* group, BView* parent)
++{
++	const char* name = group->Name();
++	if (!flick_control_group_is_hidden(name) && group->CountParameters() > 0) {
++		// A group with one control needs no box: the control has the name.
++		const bool single = group->CountParameters() == 1;
++		BBox* box = NULL;
++		BView* target = parent;
++		if (!single) {
++			box = new BBox(name);
++			box->SetLabel(translated(name));
++			BGroupView* inside
++				= new BGroupView(B_VERTICAL, B_USE_HALF_ITEM_SPACING);
++			inside->GroupLayout()->SetInsets(B_USE_ITEM_INSETS,
++				B_USE_ITEM_INSETS, B_USE_ITEM_INSETS, B_USE_ITEM_INSETS);
++			box->AddChild(inside);
++			target = inside;
++		}
++
++		size_t before = fEntries.size();
++		for (int32 i = 0; i < group->CountParameters(); i++)
++			_AddParameter(group->ParameterAt(i), target);
++
++		if (fEntries.size() > before) {
++			if (box != NULL)
++				parent->AddChild(box);
++			_UpdateAutomatic(fGroupCount);
++			fGroupCount++;
++		} else
++			delete box;
++	}
++
++	for (int32 i = 0; i < group->CountGroups(); i++)
++		_AddGroup(group->GroupAt(i), parent);
++}
++
++
++void
++FlickControlsWindow::_AddParameter(BParameter* parameter, BView* box)
++{
++	if (parameter->Kind() != NULL && strcmp(parameter->Kind(), B_RESOLUTION) == 0)
++		return;
++
++	const int32 index = (int32)fEntries.size();
++	FlickControlEntry* entry = new FlickControlEntry;
++	entry->parameter = parameter;
++	entry->control = NULL;
++	entry->group = fGroupCount;
++	entry->minimum = 0.0f;
++	entry->maximum = 0.0f;
++	entry->steps = 0;
++	entry->isAutomatic = false;
++
++	const char* name = translated(parameter->Name());
++	size_t size = 0;
++	bigtime_t changed = 0;
++
++	if (parameter->Type() == BParameter::B_CONTINUOUS_PARAMETER) {
++		BContinuousParameter* range
++			= static_cast<BContinuousParameter*>(parameter);
++		entry->minimum = range->MinValue();
++		entry->maximum = range->MaxValue();
++		entry->steps = flick_slider_steps(entry->minimum, entry->maximum,
++			range->ValueStep());
++		if (entry->steps == 0) {
++			delete entry;
++			return;
++		}
++
++		BMessage* message = new BMessage(kMsgSlider);
++		message->AddInt32("entry", index);
++		BMessage* modification = new BMessage(kMsgSlider);
++		modification->AddInt32("entry", index);
++		ValueSlider* slider = new ValueSlider(name, message, entry->steps,
++			entry->minimum, entry->maximum);
++		slider->SetModificationMessage(modification);
++		float value = entry->minimum;
++		size = sizeof(value);
++		if (parameter->GetValue(&value, &size, &changed) == B_OK) {
++			slider->SetValue(flick_slider_position(value, entry->minimum,
++				entry->maximum, entry->steps));
++		}
++		entry->control = slider;
++	} else if (parameter->Type() == BParameter::B_DISCRETE_PARAMETER) {
++		BDiscreteParameter* choice = static_cast<BDiscreteParameter*>(parameter);
++		int32 value = 0;
++		size = sizeof(value);
++		parameter->GetValue(&value, &size, &changed);
++
++		if (choice->CountItems() > 0) {
++			BPopUpMenu* menu = new BPopUpMenu(name);
++			for (int32 i = 0; i < choice->CountItems(); i++) {
++				BMessage* item = new BMessage(kMsgChoice);
++				item->AddInt32("entry", index);
++				item->AddInt32("value", choice->ItemValueAt(i));
++				BMenuItem* menuItem = new BMenuItem(
++					translated(choice->ItemNameAt(i)), item);
++				menuItem->SetMarked(choice->ItemValueAt(i) == value);
++				menu->AddItem(menuItem);
++			}
++			BMenuField* field = new BMenuField(name, name, menu);
++			box->AddChild(field);
++			// The menu sends the value itself, the entry only keeps the parameter.
++			menu->SetTargetForItems(this);
++			fEntries.push_back(entry);
++			return;
++		}
++
++		BMessage* message = new BMessage(kMsgSwitch);
++		message->AddInt32("entry", index);
++		BCheckBox* check = new BCheckBox(name, name, message);
++		check->SetValue(value != 0 ? B_CONTROL_ON : B_CONTROL_OFF);
++		entry->isAutomatic = strcmp(parameter->Name(), "Auto") == 0;
++		entry->control = check;
++	} else {
++		delete entry;
++		return;
++	}
++
++	entry->control->SetTarget(this);
++	box->AddChild(entry->control);
++	fEntries.push_back(entry);
++}
++
++
++void
++FlickControlsWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgSlider:
++		case kMsgSwitch:
++		case kMsgChoice:
++			_Change(message);
++			break;
++
++		default:
++			BWindow::MessageReceived(message);
++			break;
++	}
++}
++
++
++void
++FlickControlsWindow::_Change(BMessage* message)
++{
++	int32 index;
++	if (message->FindInt32("entry", &index) != B_OK || index < 0
++		|| index >= (int32)fEntries.size()) {
++		return;
++	}
++
++	FlickControlEntry* entry = fEntries[index];
++	if (message->what == kMsgSlider) {
++		BSlider* slider = static_cast<BSlider*>(entry->control);
++		float value = flick_slider_value(slider->Value(), entry->minimum,
++			entry->maximum, entry->steps);
++		entry->parameter->SetValue(&value, sizeof(value), 0);
++	} else if (message->what == kMsgSwitch) {
++		int32 value = entry->control->Value() == B_CONTROL_ON ? 1 : 0;
++		entry->parameter->SetValue(&value, sizeof(value), 0);
++		if (entry->isAutomatic)
++			_UpdateAutomatic(entry->group);
++	} else {
++		int32 value;
++		if (message->FindInt32("value", &value) == B_OK)
++			entry->parameter->SetValue(&value, sizeof(value), 0);
++	}
++}
++
++
++/*!	While the camera adjusts a value on its own, the sliders of that group
++	cannot be moved.
++*/
++void
++FlickControlsWindow::_UpdateAutomatic(int32 group)
++{
++	bool automatic = false;
++	for (size_t i = 0; i < fEntries.size(); i++) {
++		if (fEntries[i]->group == group && fEntries[i]->isAutomatic
++			&& fEntries[i]->control->Value() == B_CONTROL_ON) {
++			automatic = true;
++		}
++	}
++	for (size_t i = 0; i < fEntries.size(); i++) {
++		if (fEntries[i]->group == group && !fEntries[i]->isAutomatic
++			&& fEntries[i]->control != NULL
++			&& fEntries[i]->parameter->Type()
++				== BParameter::B_CONTINUOUS_PARAMETER) {
++			fEntries[i]->control->SetEnabled(!automatic);
++		}
++	}
++}
+diff --git a/src/apps/flick/FlickControls.h b/src/apps/flick/FlickControls.h
+new file mode 100644
+index 0000000000..963503b516
+--- /dev/null
++++ b/src/apps/flick/FlickControls.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_CONTROLS_H
++#define FLICK_CONTROLS_H
++
++
++#include <MediaNode.h>
++#include <Messenger.h>
++#include <Window.h>
++
++#include <vector>
++
++class BParameter;
++class BParameterGroup;
++class BParameterWeb;
++class BView;
++struct FlickControlEntry;
++
++
++/*!	The window with the picture settings of the camera: brightness, contrast,
++	white balance, exposure and so on. It shows what the camera reports in its
++	parameter web, one box for each group, and sends every change to the camera.
++*/
++class FlickControlsWindow : public BWindow {
++public:
++								FlickControlsWindow(const media_node& camera,
++									const BMessenger& owner);
++	virtual						~FlickControlsWindow();
++
++	//! B_OK if the camera has controls to show.
++			status_t			InitCheck() const { return fStatus; }
++
++	virtual	bool				QuitRequested();
++	virtual	void				MessageReceived(BMessage* message);
++
++private:
++			void				_Build();
++			void				_AddGroup(BParameterGroup* group,
++									BView* parent);
++			void				_AddParameter(BParameter* parameter,
++									BView* box);
++			void				_Change(BMessage* message);
++			void				_UpdateAutomatic(int32 group);
++
++			BParameterWeb*		fWeb;
++			media_node			fCamera;
++			BMessenger			fOwner;
++			status_t			fStatus;
++			std::vector<FlickControlEntry*>	fEntries;
++			int32				fGroupCount;
++};
++
++
++#endif	// FLICK_CONTROLS_H
+diff --git a/src/apps/flick/FlickControlsLogic.h b/src/apps/flick/FlickControlsLogic.h
+new file mode 100644
+index 0000000000..802c8051c1
+--- /dev/null
++++ b/src/apps/flick/FlickControlsLogic.h
+@@ -0,0 +1,82 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_CONTROLS_LOGIC_H
++#define FLICK_CONTROLS_LOGIC_H
++
++
++#include <math.h>
++#include <stdint.h>
++#include <string.h>
++
++
++static const int32_t kFlickMaxSliderSteps = 100000;
++static const int32_t kFlickDefaultSliderSteps = 1000;
++
++
++/*!	Tells whether a group of the camera's parameter web is left out of the
++	controls: the info text and the format list, because Flick sets the size
++	itself.
++*/
++static inline bool
++flick_control_group_is_hidden(const char* name)
++{
++	return name == NULL || name[0] == '\0' || strcmp(name, "Info") == 0
++		|| strcmp(name, "Format") == 0;
++}
++
++
++/*!	How many steps a slider for the range \a minimum to \a maximum has, when
++	the camera counts in steps of \a step. Without a usable step the slider
++	gets a fixed number of steps. Returns 0 for a range that has no width:
++	there is nothing to move.
++*/
++static inline int32_t
++flick_slider_steps(float minimum, float maximum, float step)
++{
++	if (!(maximum > minimum))
++		return 0;
++
++	if (step > 0.0f) {
++		float steps = floorf((maximum - minimum) / step + 0.5f);
++		if (steps >= 1.0f && steps <= (float)kFlickMaxSliderSteps)
++			return (int32_t)steps;
++	}
++	return kFlickDefaultSliderSteps;
++}
++
++
++//!	The slider position (0 to \a steps) that shows \a value.
++static inline int32_t
++flick_slider_position(float value, float minimum, float maximum, int32_t steps)
++{
++	if (steps <= 0 || !(maximum > minimum) || !(value == value))
++		return 0;
++	if (value <= minimum)
++		return 0;
++	if (value >= maximum)
++		return steps;
++
++	return (int32_t)floorf((value - minimum) / (maximum - minimum)
++		* (float)steps + 0.5f);
++}
++
++
++//!	The parameter value that a slider \a position stands for.
++static inline float
++flick_slider_value(int32_t position, float minimum, float maximum,
++	int32_t steps)
++{
++	if (steps <= 0 || position <= 0)
++		return minimum;
++	if (position >= steps)
++		return maximum;
++
++	return minimum + (maximum - minimum) * (float)position / (float)steps;
++}
++
++
++#endif	// FLICK_CONTROLS_LOGIC_H
+diff --git a/src/apps/flick/FlickIcons.cpp b/src/apps/flick/FlickIcons.cpp
+new file mode 100644
+index 0000000000..01b430ee6b
+--- /dev/null
++++ b/src/apps/flick/FlickIcons.cpp
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickIcons.h"
++
++#include <Bitmap.h>
++#include <InterfaceDefs.h>
++#include <View.h>
++
++#include <math.h>
++#include <string.h>
++
++
++//!	A stopwatch: a ring, the button on top and one hand.
++static void
++draw_self_timer(BView* view, float size)
++{
++	float pen = max_c(1.5f, size / 12);
++	BPoint center(size / 2, size * 0.56f);
++	float radius = size * 0.36f;
++	view->SetPenSize(pen);
++	view->StrokeEllipse(center, radius, radius);
++	view->FillRect(BRect(size * 0.42f, size * 0.04f, size * 0.58f,
++		size * 0.14f));
++	view->StrokeLine(BPoint(center.x, center.y - radius),
++		BPoint(center.x, center.y - radius - size * 0.06f));
++	view->StrokeLine(center, BPoint(center.x + radius * 0.5f,
++		center.y - radius * 0.6f));
++}
++
++
++//!	Two arrow heads facing away from a line in the middle.
++static void
++draw_mirror(BView* view, float size)
++{
++	float middle = size / 2;
++	float gap = size * 0.09f;
++	float top = size * 0.2f;
++	float bottom = size * 0.8f;
++	BPoint left[3] = { BPoint(middle - gap, top), BPoint(middle - gap, bottom),
++		BPoint(size * 0.06f, size / 2) };
++	BPoint right[3] = { BPoint(middle + gap, top), BPoint(middle + gap, bottom),
++		BPoint(size * 0.94f, size / 2) };
++	view->FillPolygon(left, 3);
++	view->SetPenSize(max_c(1.0f, size / 16));
++	view->StrokePolygon(right, 3);
++
++	float dash = size / 8;
++	for (float y = 0; y < size; y += dash * 2)
++		view->StrokeLine(BPoint(middle, y), BPoint(middle, y + dash - 1));
++}
++
++
++//!	Three sliders with their knobs at different places.
++static void
++draw_settings(BView* view, float size)
++{
++	static const float kKnobs[3] = { 0.3f, 0.68f, 0.45f };
++	float pen = max_c(1.0f, size / 14);
++	float knob = size * 0.11f;
++	view->SetPenSize(pen);
++	for (int i = 0; i < 3; i++) {
++		float y = size * (0.2f + 0.3f * i);
++		view->StrokeLine(BPoint(size * 0.08f, y), BPoint(size * 0.92f, y));
++		view->FillEllipse(BPoint(size * kKnobs[i], y), knob, knob);
++	}
++}
++
++
++BBitmap*
++flick_create_icon(flick_icon icon, float size)
++{
++	size = floorf(size);
++	BRect bounds(0, 0, size - 1, size - 1);
++	BBitmap* bitmap = new BBitmap(bounds, B_BITMAP_ACCEPTS_VIEWS, B_RGBA32);
++	if (bitmap->InitCheck() != B_OK) {
++		delete bitmap;
++		return NULL;
++	}
++	memset(bitmap->Bits(), 0, bitmap->BitsLength());
++
++	BView* view = new BView(bounds, "icon", B_FOLLOW_NONE, 0);
++	bitmap->AddChild(view);
++	bitmap->Lock();
++	view->SetDrawingMode(B_OP_ALPHA);
++	view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_COMPOSITE);
++	view->SetHighColor(ui_color(B_CONTROL_TEXT_COLOR));
++
++	switch (icon) {
++		case FLICK_ICON_SELF_TIMER:
++			draw_self_timer(view, size);
++			break;
++		case FLICK_ICON_MIRROR:
++			draw_mirror(view, size);
++			break;
++		case FLICK_ICON_SETTINGS:
++			draw_settings(view, size);
++			break;
++	}
++
++	view->Sync();
++	bitmap->RemoveChild(view);
++	bitmap->Unlock();
++	delete view;
++	return bitmap;
++}
+diff --git a/src/apps/flick/FlickIcons.h b/src/apps/flick/FlickIcons.h
+new file mode 100644
+index 0000000000..61610ae720
+--- /dev/null
++++ b/src/apps/flick/FlickIcons.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_ICONS_H
++#define FLICK_ICONS_H
++
++
++#include <SupportDefs.h>
++
++class BBitmap;
++
++
++enum flick_icon {
++	FLICK_ICON_SELF_TIMER,
++	FLICK_ICON_MIRROR,
++	FLICK_ICON_SETTINGS
++};
++
++
++/*!	Draws \a icon in the color of control texts, \a size pixels wide and high.
++	The caller owns the bitmap. Returns NULL if there is not enough memory.
++*/
++BBitmap*	flick_create_icon(flick_icon icon, float size);
++
++
++#endif	// FLICK_ICONS_H
+diff --git a/src/apps/flick/FlickLogic.cpp b/src/apps/flick/FlickLogic.cpp
+new file mode 100644
+index 0000000000..b101e7765e
+--- /dev/null
++++ b/src/apps/flick/FlickLogic.cpp
+@@ -0,0 +1,233 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickLogic.h"
++
++#include <stdio.h>
++#include <string.h>
++
++
++static uint64_t
++area_of(const flick_size& size)
++{
++	return (uint64_t)size.width * size.height;
++}
++
++
++size_t
++flick_photo_file_name(char* buffer, size_t size, time_t when, int duplicate)
++{
++	if (size == 0)
++		return 0;
++
++	struct tm parts;
++	localtime_r(&when, &parts);
++
++	char date[32];
++	strftime(date, sizeof(date), "%Y-%m-%d %H.%M.%S", &parts);
++
++	if (duplicate > 0)
++		snprintf(buffer, size, "Flick %s %d.png", date, duplicate + 1);
++	else
++		snprintf(buffer, size, "Flick %s.png", date);
++
++	return strlen(buffer);
++}
++
++
++size_t
++flick_size_label(char* buffer, size_t size, uint32_t width, uint32_t height)
++{
++	if (size == 0)
++		return 0;
++
++	snprintf(buffer, size, "%u \xc3\x97 %u", (unsigned)width,
++		(unsigned)height);
++	return strlen(buffer);
++}
++
++
++size_t
++flick_size_menu_label(char* buffer, size_t size, const flick_size& cameraSize)
++{
++	if (cameraSize.name[0] == '\0') {
++		return flick_size_label(buffer, size, cameraSize.width,
++			cameraSize.height);
++	}
++	if (size == 0)
++		return 0;
++
++	snprintf(buffer, size, "%s", cameraSize.name);
++	return strlen(buffer);
++}
++
++
++int
++flick_default_size_index(const flick_size* sizes, int count)
++{
++	if (sizes == NULL || count <= 0)
++		return -1;
++
++	int largestFitting = -1;
++	int smallest = 0;
++	for (int i = 0; i < count; i++) {
++		if (sizes[i].width == 640 && sizes[i].height == 480)
++			return i;
++
++		if (sizes[i].width <= 1280 && sizes[i].height <= 720
++			&& (largestFitting < 0
++				|| area_of(sizes[i]) > area_of(sizes[largestFitting]))) {
++			largestFitting = i;
++		}
++		if (area_of(sizes[i]) < area_of(sizes[smallest]))
++			smallest = i;
++	}
++
++	return largestFitting >= 0 ? largestFitting : smallest;
++}
++
++
++int
++flick_sort_sizes(flick_size* sizes, int count)
++{
++	for (int i = 1; i < count; i++) {
++		flick_size current = sizes[i];
++		int j = i - 1;
++		while (j >= 0 && area_of(sizes[j]) > area_of(current)) {
++			sizes[j + 1] = sizes[j];
++			j--;
++		}
++		sizes[j + 1] = current;
++	}
++
++	int unique = 0;
++	for (int i = 0; i < count; i++) {
++		if (unique > 0 && sizes[unique - 1].width == sizes[i].width
++			&& sizes[unique - 1].height == sizes[i].height) {
++			continue;
++		}
++		sizes[unique++] = sizes[i];
++	}
++	return unique;
++}
++
++
++static const int kParameterSizeShift = 16;
++static const uint32_t kParameterSizeMask = 0xffff;
++
++
++bool
++flick_size_from_parameter(int32_t value, flick_size* size)
++{
++	uint32_t width = ((uint32_t)value >> kParameterSizeShift)
++		& kParameterSizeMask;
++	uint32_t height = (uint32_t)value & kParameterSizeMask;
++	if (width == 0 || height == 0)
++		return false;
++
++	size->width = width;
++	size->height = height;
++	return true;
++}
++
++
++static const int64_t kMicrosecondsPerSecond = 1000000;
++
++
++void
++flick_rate_start(flick_rate_meter* meter, int64_t now)
++{
++	meter->start = now;
++	meter->frames = 0;
++}
++
++
++bool
++flick_rate_add_frame(flick_rate_meter* meter, int64_t now, int* rate)
++{
++	meter->frames++;
++	int64_t elapsed = now - meter->start;
++	if (elapsed < kMicrosecondsPerSecond)
++		return false;
++
++	*rate = (int)((meter->frames * kMicrosecondsPerSecond + elapsed / 2)
++		/ elapsed);
++	flick_rate_start(meter, now);
++	return true;
++}
++
++
++static const float kDragDistance = 4;
++
++
++bool
++flick_is_drag(float dx, float dy)
++{
++	return dx > kDragDistance || dx < -kDragDistance
++		|| dy > kDragDistance || dy < -kDragDistance;
++}
++
++
++static uint32_t
++scaled_side(uint32_t side, uint32_t limit, uint32_t longest)
++{
++	uint32_t scaled = (uint32_t)((uint64_t)side * limit / longest);
++	return scaled == 0 && side > 0 ? 1 : scaled;
++}
++
++
++flick_size
++flick_fit_size(uint32_t width, uint32_t height, uint32_t limit)
++{
++	uint32_t longest = width > height ? width : height;
++	if (longest <= limit)
++		return flick_size{ width, height };
++
++	return flick_size{ scaled_side(width, limit, longest),
++		scaled_side(height, limit, longest) };
++}
++
++
++void
++flick_countdown_start(flick_countdown* countdown, int seconds)
++{
++	countdown->left = seconds > 0 ? seconds : 0;
++}
++
++
++void
++flick_countdown_stop(flick_countdown* countdown)
++{
++	countdown->left = 0;
++}
++
++
++bool
++flick_countdown_running(const flick_countdown* countdown)
++{
++	return countdown->left > 0;
++}
++
++
++bool
++flick_countdown_tick(flick_countdown* countdown)
++{
++	if (countdown->left <= 0)
++		return false;
++	countdown->left--;
++	return countdown->left == 0;
++}
++
++
++uint8_t
++flick_flash_alpha(int64_t elapsed, int64_t length)
++{
++	if (elapsed < 0 || elapsed >= length)
++		return 0;
++	return (uint8_t)(255 * (length - elapsed) / length);
++}
+diff --git a/src/apps/flick/FlickLogic.h b/src/apps/flick/FlickLogic.h
+new file mode 100644
+index 0000000000..20a38e0654
+--- /dev/null
++++ b/src/apps/flick/FlickLogic.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_LOGIC_H
++#define FLICK_LOGIC_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++#include <time.h>
++
++
++static const size_t kFlickSizeNameLength = 64;
++
++
++struct flick_size {
++			uint32_t			width;
++			uint32_t			height;
++			char				name[kFlickSizeNameLength];
++				// the camera's own name for the size, empty if it has none
++};
++
++
++/*!	Writes the file name for a photo taken at \a when, for example
++	"Flick 2026-11-19 23.20.45.png". \a duplicate is 0 for the first photo
++	of a second; a larger number is shown as " 2", " 3" and so on, so that two
++	photos in the same second do not overwrite each other. The name is cut to
++	fit \a size. Returns the length of the name.
++*/
++size_t	flick_photo_file_name(char* buffer, size_t size, time_t when,
++			int duplicate);
++
++//!	Writes a label like "640 x 480" (with the multiplication sign).
++size_t	flick_size_label(char* buffer, size_t size, uint32_t width,
++			uint32_t height);
++
++/*!	Writes the label for the size menu: the camera's own name, which may tell
++	the frame rate and format, otherwise "640 x 480".
++*/
++size_t	flick_size_menu_label(char* buffer, size_t size,
++			const flick_size& cameraSize);
++
++/*!	Chooses the size a camera starts with: 640 x 480 if it has it, otherwise
++	the largest one that is not bigger than 1280 x 720, otherwise the smallest.
++	Returns the index into \a sizes, or -1 if there is none.
++*/
++int		flick_default_size_index(const flick_size* sizes, int count);
++
++/*!	Sorts \a sizes from small to large and removes duplicates. Returns the
++	new number of sizes.
++*/
++int		flick_sort_sizes(flick_size* sizes, int count);
++
++/*!	Reads a size from an item of the camera's B_RESOLUTION parameter: width in
++	the upper, height in the lower 16 bits. Returns false and leaves \a size
++	alone if the value holds no size.
++*/
++bool	flick_size_from_parameter(int32_t value, flick_size* size);
++
++
++//!	Counts shown frames over one second at a time. Times are in microseconds.
++struct flick_rate_meter {
++			int64_t				start;
++			int					frames;
++};
++
++void	flick_rate_start(flick_rate_meter* meter, int64_t now);
++
++/*!	Counts one frame shown at \a now. When a second or more has passed, writes
++	the rounded frames per second to \a rate, starts a new second and returns
++	true.
++*/
++bool	flick_rate_add_frame(flick_rate_meter* meter, int64_t now, int* rate);
++
++
++//!	Tells whether the mouse moved far enough with the button down to drag.
++bool	flick_is_drag(float dx, float dy);
++
++/*!	Returns the size of a picture of \a width x \a height made to fit into
++	\a limit x \a limit with its proportions. It is never made larger, and a
++	side that is not empty does not become empty.
++*/
++flick_size	flick_fit_size(uint32_t width, uint32_t height, uint32_t limit);
++
++
++//!	The self-timer: counts whole seconds down to the photo.
++struct flick_countdown {
++			int					left;
++};
++
++void	flick_countdown_start(flick_countdown* countdown, int seconds);
++void	flick_countdown_stop(flick_countdown* countdown);
++bool	flick_countdown_running(const flick_countdown* countdown);
++
++/*!	One second has passed. Returns true when the photo is due; the countdown
++	has then ended. A countdown that does not run never returns true.
++*/
++bool	flick_countdown_tick(flick_countdown* countdown);
++
++
++/*!	Returns how strongly the flash covers the picture \a elapsed microseconds
++	after the photo: 255 at the start, fading to 0 after \a length.
++*/
++uint8_t	flick_flash_alpha(int64_t elapsed, int64_t length);
++
++
++#endif	// FLICK_LOGIC_H
+diff --git a/src/apps/flick/FlickWindow.cpp b/src/apps/flick/FlickWindow.cpp
+new file mode 100644
+index 0000000000..717a68e402
+--- /dev/null
++++ b/src/apps/flick/FlickWindow.cpp
+@@ -0,0 +1,1204 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "FlickWindow.h"
++
++#include <AffineTransform.h>
++#include <Alert.h>
++#include <Application.h>
++#include <Bitmap.h>
++#include <BitmapStream.h>
++#include <Button.h>
++#include <Catalog.h>
++#include <ControlLook.h>
++#include <Directory.h>
++#include <Entry.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <LayoutBuilder.h>
++#include <Menu.h>
++#include <MenuBar.h>
++#include <MenuField.h>
++#include <MenuItem.h>
++#include <MessageRunner.h>
++#include <NodeInfo.h>
++#include <Path.h>
++#include <PopUpMenu.h>
++#include <String.h>
++#include <StringView.h>
++#include <TranslatorFormats.h>
++#include <TranslatorRoster.h>
++#include <View.h>
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#include "FlickConsumer.h"
++#include "FlickControls.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "FlickWindow"
++
++
++static const uint32 kMsgShutter = 'FlSh';
++static const uint32 kMsgCamera = 'FlCm';
++static const uint32 kMsgSize = 'FlSz';
++static const uint32 kMsgResetStatus = 'FlRs';
++static const uint32 kMsgStartCamera = 'FlSt';
++static const uint32 kMsgToggleRate = 'FlRt';
++static const uint32 kMsgPhotoWritten = 'FlPw';
++static const uint32 kMsgShowControls = 'FlCt';
++static const uint32 kMsgControlsClosed = 'FcCl';
++static const uint32 kMsgSelfTimer = 'FlTm';
++static const uint32 kMsgMirror = 'FlMi';
++static const uint32 kMsgCountdownTick = 'FlCd';
++
++static const uint32 kDragImageLimit = 160;
++static const bigtime_t kFlashLength = 350000;
++static const int kSelfTimerSeconds = 3;
++static const uint8 kDragImageAlpha = 170;
++
++
++/*!	Writes \a picture as PNG into \a file. The bitmap stays with the caller.
++*/
++static status_t
++write_png(BBitmap* picture, BFile* file)
++{
++	BBitmapStream stream(picture);
++	status_t status = BTranslatorRoster::Default()->Translate(&stream, NULL,
++		NULL, file, B_PNG_FORMAT);
++
++	BBitmap* released;
++	stream.DetachBitmap(&released);
++
++	if (status == B_OK)
++		BNodeInfo(file).SetType("image/png");
++	return status;
++}
++
++
++//	#pragma mark - FlickView
++
++
++/*!	Shows the live picture, as large as fits and with its own proportions.
++*/
++class FlickView : public BView {
++public:
++	FlickView()
++		:
++		BView("preview", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
++		fBitmap(NULL),
++		fHasPicture(false),
++		fFlashStart(0),
++		fMirrored(true),
++		fCountdown(0),
++		fCrossedOut(false),
++		fDragPicture(NULL),
++		fMayDrag(false)
++	{
++		SetViewColor(B_TRANSPARENT_COLOR);
++		SetExplicitMinSize(BSize(320, 240));
++		SetExplicitPreferredSize(BSize(640, 480));
++	}
++
++	virtual ~FlickView()
++	{
++		delete fBitmap;
++		delete fDragPicture;
++	}
++
++	virtual void MouseDown(BPoint where)
++	{
++		if (fBitmap == NULL || !fHasPicture)
++			return;
++		fMayDrag = true;
++		fDragStart = where;
++		SetMouseEventMask(B_POINTER_EVENTS);
++	}
++
++	virtual void MouseMoved(BPoint where, uint32 transit,
++		const BMessage* dragMessage)
++	{
++		if (!fMayDrag
++			|| !flick_is_drag(where.x - fDragStart.x, where.y - fDragStart.y))
++			return;
++		fMayDrag = false;
++		_BeginDrag();
++	}
++
++	virtual void MouseUp(BPoint where)
++	{
++		fMayDrag = false;
++	}
++
++	virtual void MessageReceived(BMessage* message)
++	{
++		if (message->what == B_COPY_TARGET) {
++			_WriteDragPicture(message);
++			return;
++		}
++		BView::MessageReceived(message);
++	}
++
++	void SetPictureSize(uint32 width, uint32 height)
++	{
++		delete fBitmap;
++		fBitmap = new BBitmap(BRect(0, 0, width - 1, height - 1), B_RGB32);
++		if (fBitmap->InitCheck() != B_OK) {
++			delete fBitmap;
++			fBitmap = NULL;
++		}
++		fHasPicture = false;
++		Invalidate();
++	}
++
++	/*!	Shown instead of the picture as long as there is none: a camera, crossed
++		out if there is no camera or it does not work, with a short text.
++	*/
++	void SetPlaceholder(bool crossedOut, const char* title, const char* hint)
++	{
++		fCrossedOut = crossedOut;
++		fTitle = title;
++		fHint = hint;
++		Invalidate();
++	}
++
++	BBitmap* Bitmap() const
++	{
++		return fBitmap;
++	}
++
++	bool HasPicture() const
++	{
++		return fHasPicture;
++	}
++
++	void PictureChanged()
++	{
++		fHasPicture = true;
++		Invalidate();
++	}
++
++	void Flash()
++	{
++		fFlashStart = system_time();
++		Invalidate();
++	}
++
++	//!	Only the live picture is mirrored, photos keep the camera's view.
++	void SetMirrored(bool mirrored)
++	{
++		fMirrored = mirrored;
++		Invalidate();
++	}
++
++	//!	Shows the seconds left of the self-timer; 0 hides them.
++	void SetCountdown(int secondsLeft)
++	{
++		fCountdown = secondsLeft;
++		Invalidate();
++	}
++
++	virtual void Draw(BRect updateRect)
++	{
++		if (fBitmap == NULL || !fHasPicture) {
++			_DrawPlaceholder();
++			return;
++		}
++
++		SetHighColor(0, 0, 0);
++		FillRect(Bounds());
++
++		BRect target = _PictureFrame();
++		if (fMirrored) {
++			BAffineTransform mirror;
++			mirror.ScaleBy(BPoint((target.left + target.right) / 2, 0), -1, 1);
++			SetTransform(mirror);
++		}
++		SetDrawingMode(B_OP_COPY);
++		DrawBitmap(fBitmap, fBitmap->Bounds(), target,
++			B_FILTER_BITMAP_BILINEAR);
++		SetTransform(BAffineTransform());
++
++		_DrawFlash(target);
++		_DrawCountdown(target);
++	}
++
++private:
++	BRect _PictureFrame() const
++	{
++		BRect bounds = Bounds();
++		float scale = min_c(bounds.Width() / fBitmap->Bounds().Width(),
++			bounds.Height() / fBitmap->Bounds().Height());
++		float width = fBitmap->Bounds().Width() * scale;
++		float height = fBitmap->Bounds().Height() * scale;
++		BRect frame(0, 0, width, height);
++		frame.OffsetTo(bounds.left + (bounds.Width() - width) / 2,
++			bounds.top + (bounds.Height() - height) / 2);
++		return frame;
++	}
++
++	//!	White over the picture that fades out; the next frames redraw it.
++	void _DrawFlash(BRect frame)
++	{
++		uint8 alpha = flick_flash_alpha(system_time() - fFlashStart,
++			kFlashLength);
++		if (alpha == 0)
++			return;
++		SetDrawingMode(B_OP_ALPHA);
++		SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
++		SetHighColor(255, 255, 255, alpha);
++		FillRect(frame);
++		SetDrawingMode(B_OP_COPY);
++	}
++
++	//!	A large number in the middle of the picture, with a dark outline.
++	void _DrawCountdown(BRect frame)
++	{
++		if (fCountdown <= 0)
++			return;
++		BString number;
++		number << fCountdown;
++
++		BFont font(be_bold_font);
++		font.SetSize(frame.Height() * 0.4f);
++		SetFont(&font);
++		font_height height;
++		font.GetHeight(&height);
++		BPoint where((frame.left + frame.right - StringWidth(number)) / 2,
++			(frame.top + frame.bottom + height.ascent - height.descent) / 2);
++
++		SetDrawingMode(B_OP_ALPHA);
++		SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
++		SetHighColor(0, 0, 0, 120);
++		DrawString(number, where + BPoint(3, 3));
++		SetHighColor(255, 255, 255, 230);
++		DrawString(number, where);
++		SetDrawingMode(B_OP_COPY);
++		SetFont(be_plain_font);
++	}
++
++	/*!	Starts the drag of the picture shown now, with the "Passing Data via
++		File" protocol: the target (for example Tracker) creates a file and
++		answers with B_COPY_TARGET, then the picture is written into it.
++	*/
++	void _BeginDrag()
++	{
++		delete fDragPicture;
++		fDragPicture = new BBitmap(fBitmap);
++		if (fDragPicture->InitCheck() != B_OK) {
++			delete fDragPicture;
++			fDragPicture = NULL;
++			return;
++		}
++
++		char name[B_FILE_NAME_LENGTH];
++		flick_photo_file_name(name, sizeof(name), time(NULL), 0);
++
++		BMessage drag(B_SIMPLE_DATA);
++		drag.AddInt32("be:actions", B_COPY_TARGET);
++		drag.AddString("be:clip_name", name);
++		drag.AddString("be:types", B_FILE_MIME_TYPE);
++		drag.AddString("be:filetypes", "image/png");
++		drag.AddString("be:type_descriptions", B_TRANSLATE("PNG image"));
++
++		BBitmap* image = _DragImage();
++		if (image == NULL) {
++			DragMessage(&drag, Bounds());
++			return;
++		}
++		BRect bounds = image->Bounds();
++		BPoint offset(bounds.Width() / 2, bounds.Height() / 2);
++		// DragMessage() takes over the image.
++		DragMessage(&drag, image, B_OP_ALPHA, offset);
++	}
++
++	//!	A small, see-through copy of the picture that follows the mouse.
++	BBitmap* _DragImage()
++	{
++		BRect source = fDragPicture->Bounds();
++		flick_size size = flick_fit_size(source.IntegerWidth() + 1,
++			source.IntegerHeight() + 1, kDragImageLimit);
++		BRect rect(0, 0, size.width - 1, size.height - 1);
++
++		BBitmap* image = new BBitmap(rect, B_BITMAP_ACCEPTS_VIEWS, B_RGBA32);
++		if (image->InitCheck() != B_OK) {
++			delete image;
++			return NULL;
++		}
++
++		BView* view = new BView(rect, "drag image", B_FOLLOW_NONE, 0);
++		image->AddChild(view);
++		image->Lock();
++		view->DrawBitmap(fDragPicture, source, rect, B_FILTER_BITMAP_BILINEAR);
++		view->Sync();
++		image->Unlock();
++
++		uint8* row = (uint8*)image->Bits();
++		for (uint32 y = 0; y < size.height; y++, row += image->BytesPerRow()) {
++			for (uint32 x = 0; x < size.width; x++)
++				row[x * 4 + 3] = kDragImageAlpha;
++		}
++		return image;
++	}
++
++	void _WriteDragPicture(BMessage* reply)
++	{
++		entry_ref directoryRef;
++		const char* name;
++		status_t status = B_BAD_VALUE;
++		// The answer comes from another program: the name must stay inside
++		// the directory.
++		if (fDragPicture != NULL
++			&& reply->FindRef("directory", &directoryRef) == B_OK
++			&& reply->FindString("name", &name) == B_OK
++			&& strchr(name, '/') == NULL) {
++			BDirectory directory(&directoryRef);
++			BFile file(&directory, name,
++				B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++			status = file.InitCheck();
++			if (status == B_OK)
++				status = write_png(fDragPicture, &file);
++		}
++
++		BMessage written(kMsgPhotoWritten);
++		written.AddInt32("status", status);
++		if (status == B_OK)
++			written.AddString("name", name);
++		Window()->PostMessage(&written);
++	}
++
++	void _DrawPlaceholder()
++	{
++		BRect bounds = Bounds();
++
++		// Dark background with a soft gradient.
++		for (float y = bounds.top; y <= bounds.bottom; y++) {
++			float t = (y - bounds.top) / max_c(bounds.Height(), 1.0f);
++			SetHighColor(38 + 14 * t, 40 + 14 * t, 46 + 16 * t);
++			StrokeLine(BPoint(bounds.left, y), BPoint(bounds.right, y));
++		}
++
++		float size = max_c(64.0f, min_c(bounds.Width(), bounds.Height()) * 0.28f);
++		BPoint center(bounds.Width() / 2, bounds.Height() / 2 - size * 0.25f);
++		_DrawCamera(center, size);
++
++		SetDrawingMode(B_OP_OVER);
++		font_height height;
++		be_bold_font->GetHeight(&height);
++		float lineHeight = height.ascent + height.descent + height.leading;
++		float y = center.y + size * 0.62f + lineHeight;
++
++		SetFont(be_bold_font);
++		SetHighColor(225, 228, 235);
++		DrawString(fTitle.String(), BPoint(
++			(bounds.Width() - StringWidth(fTitle.String())) / 2, y));
++
++		SetFont(be_plain_font);
++		SetHighColor(160, 165, 175);
++		DrawString(fHint.String(), BPoint(
++			(bounds.Width() - StringWidth(fHint.String())) / 2,
++			y + lineHeight + 4));
++	}
++
++	void _DrawCamera(BPoint center, float size)
++	{
++		SetDrawingMode(B_OP_ALPHA);
++		SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
++		SetPenSize(max_c(2.0f, size / 28));
++
++		float half = size / 2;
++		BRect body(center.x - half, center.y - half * 0.62f,
++			center.x + half, center.y + half * 0.62f);
++		SetHighColor(190, 196, 208);
++		StrokeRoundRect(body, size / 12, size / 12);
++
++		// Bump on top and the flash at the corner.
++		StrokeRoundRect(BRect(center.x - half * 0.32f,
++			body.top - half * 0.2f, center.x + half * 0.32f, body.top),
++			size / 24, size / 24);
++
++		// Lens: two rings.
++		BPoint lens(center.x, center.y + half * 0.02f);
++		StrokeEllipse(lens, half * 0.42f, half * 0.42f);
++		StrokeEllipse(lens, half * 0.22f, half * 0.22f);
++
++		if (fCrossedOut) {
++			// A slash, with a dark edge so that it stays visible.
++			BPoint from(center.x - half * 1.05f, center.y + half * 0.8f);
++			BPoint to(center.x + half * 1.05f, center.y - half * 0.8f);
++			SetPenSize(max_c(5.0f, size / 12));
++			SetHighColor(38, 40, 46);
++			StrokeLine(from, to);
++			SetPenSize(max_c(3.0f, size / 20));
++			SetHighColor(225, 70, 70);
++			StrokeLine(from, to);
++		}
++
++		SetPenSize(1);
++		SetDrawingMode(B_OP_COPY);
++	}
++
++	BBitmap*	fBitmap;
++	bool		fHasPicture;
++	bigtime_t	fFlashStart;
++	bool		fMirrored;
++	int			fCountdown;
++	bool		fCrossedOut;
++	BString		fTitle;
++	BString		fHint;
++	BBitmap*	fDragPicture;
++	bool		fMayDrag;
++	BPoint		fDragStart;
++};
++
++
++//	#pragma mark - ShutterButton
++
++
++/*!	The red button that takes the photo.
++*/
++class ShutterButton : public BView {
++public:
++	ShutterButton(BMessage* message)
++		:
++		BView("shutter", B_WILL_DRAW),
++		fMessage(message),
++		fPressed(false),
++		fEnabled(true)
++	{
++		SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
++		SetExplicitMinSize(BSize(56, 56));
++		SetExplicitMaxSize(BSize(56, 56));
++		SetExplicitPreferredSize(BSize(56, 56));
++		SetToolTip(B_TRANSLATE("Take a photo (Space)"));
++	}
++
++	virtual ~ShutterButton()
++	{
++		delete fMessage;
++	}
++
++	void SetEnabled(bool enabled)
++	{
++		fEnabled = enabled;
++		Invalidate();
++	}
++
++	virtual void MouseDown(BPoint where)
++	{
++		if (!fEnabled)
++			return;
++		fPressed = true;
++		SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
++		Invalidate();
++	}
++
++	virtual void MouseUp(BPoint where)
++	{
++		if (!fPressed)
++			return;
++		fPressed = false;
++		Invalidate();
++		if (Bounds().Contains(where))
++			Window()->PostMessage(fMessage);
++	}
++
++	virtual void Draw(BRect updateRect)
++	{
++		SetLowUIColor(B_PANEL_BACKGROUND_COLOR);
++		FillRect(Bounds(), B_SOLID_LOW);
++
++		SetDrawingMode(B_OP_ALPHA);
++		SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
++
++		BRect circle = Bounds().InsetByCopy(3, 3);
++		BPoint center((circle.left + circle.right) / 2,
++			(circle.top + circle.bottom) / 2);
++		SetHighColor(_FaceColor());
++		FillEllipse(circle);
++		SetHighColor(110, 10, 10, 200);
++		StrokeEllipse(circle);
++
++		// A small camera, centered as a whole: the bump on top and the body
++		// span kCameraTop to kCameraBottom around the center of the button.
++		const float kHalfWidth = 12;
++		const float kCameraTop = -10;
++		const float kBodyTop = -6;
++		const float kCameraBottom = 10;
++		BRect body(center.x - kHalfWidth, center.y + kBodyTop,
++			center.x + kHalfWidth, center.y + kCameraBottom);
++		SetHighColor(255, 255, 255);
++		FillRoundRect(body, 3, 3);
++		FillRoundRect(BRect(center.x - 5, center.y + kCameraTop, center.x + 5,
++			center.y + kBodyTop + 1), 2, 2);
++
++		// The lens: a ring in the button color and a white dot, both around
++		// the center of the body.
++		BPoint lens(center.x, (body.top + body.bottom) / 2);
++		SetHighColor(_FaceColor());
++		FillEllipse(lens, 6, 6);
++		SetHighColor(255, 255, 255);
++		FillEllipse(lens, 3, 3);
++	}
++
++private:
++	rgb_color _FaceColor() const
++	{
++		if (!fEnabled)
++			return make_color(170, 170, 170);
++		if (fPressed)
++			return make_color(150, 15, 15);
++		return make_color(225, 30, 30);
++	}
++
++
++	BMessage*	fMessage;
++	bool		fPressed;
++	bool		fEnabled;
++};
++
++
++//	#pragma mark - FlickWindow
++
++
++FlickWindow::FlickWindow(uint32 preferredWidth, uint32 preferredHeight)
++	:
++	BWindow(BRect(100, 100, 740, 640), B_TRANSLATE_SYSTEM_NAME("Flick"),
++		B_TITLED_WINDOW,
++		B_ASYNCHRONOUS_CONTROLS | B_AUTO_UPDATE_SIZE_LIMITS),
++	fCamera(NULL),
++	fControlsWindow(NULL),
++	fView(NULL),
++	fStatus(NULL),
++	fShutter(NULL),
++	fCameraMenu(NULL),
++	fCameraPopUp(NULL),
++	fSelfTimerButton(NULL),
++	fMirrorButton(NULL),
++	fSelfTimerItem(NULL),
++	fMirrorItem(NULL),
++	fSizeMenu(NULL),
++	fCurrentCamera(-1),
++	fSizeCount(0),
++	fCurrentSize(-1),
++	fPreferredWidth(preferredWidth),
++	fPreferredHeight(preferredHeight),
++	fStatusRunner(NULL),
++	fRate(-1),
++	fShowRate(false),
++	fSelfTimer(false),
++	fMirrored(true),
++	fCountdownRunner(NULL)
++{
++	flick_rate_start(&fRateMeter, system_time());
++	flick_countdown_start(&fCountdown, 0);
++	BMenuBar* menuBar = new BMenuBar("menubar");
++	_BuildMenus(menuBar);
++
++	fView = new FlickView();
++	fView->SetMirrored(fMirrored);
++
++	BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
++		.Add(menuBar)
++		.Add(fView, 1.0f)
++		.Add(_BuildBar());
++
++	fCamera = new FlickCamera(BMessenger(this));
++
++	// The window comes first, the camera takes a moment.
++	_ShowPlaceholder(false, B_TRANSLATE("Looking for a camera" B_UTF8_ELLIPSIS),
++		"");
++	fShutter->SetEnabled(false);
++	PostMessage(kMsgStartCamera);
++}
++
++
++FlickWindow::~FlickWindow()
++{
++	delete fCountdownRunner;
++	delete fStatusRunner;
++	delete fCamera;
++}
++
++
++bool
++FlickWindow::QuitRequested()
++{
++	// The window goes first; the user does not have to watch the camera
++	// being given back, which may take a moment with some cameras.
++	Hide();
++
++	// The camera must be given back before the application ends, otherwise
++	// the next start finds it still taken.
++	_StopCountdown();
++	_CloseControls();
++	delete fCamera;
++	fCamera = NULL;
++	be_app->PostMessage(B_QUIT_REQUESTED);
++	return true;
++}
++
++
++void
++FlickWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgFlickFrame:
++			if (fCamera != NULL && fCamera->Consumer() != NULL
++				&& fView->Bitmap() != NULL
++				&& fCamera->Consumer()->CopyFrame(fView->Bitmap())) {
++				fView->PictureChanged();
++				_CountFrame();
++			}
++			break;
++
++		case kMsgToggleRate:
++			_ToggleRate(message);
++			break;
++
++		case kMsgShowControls:
++			_ShowControls();
++			break;
++
++		case kMsgControlsClosed:
++			// The window is gone, it told us before it quit.
++			fControlsWindow = NULL;
++			break;
++
++		case kMsgStartCamera:
++			_FindCameras();
++			break;
++
++		case kMsgShutter:
++			_Shutter();
++			break;
++
++		case kMsgCountdownTick:
++			_CountDown();
++			break;
++
++		case kMsgSelfTimer:
++			_ToggleSelfTimer();
++			break;
++
++		case kMsgMirror:
++			_ToggleMirror();
++			break;
++
++		case kMsgCamera:
++		{
++			int32 index;
++			if (message->FindInt32("index", &index) == B_OK)
++				_SelectCamera(index);
++			break;
++		}
++
++		case kMsgSize:
++		{
++			int32 index;
++			if (message->FindInt32("index", &index) == B_OK)
++				_SelectSize(index);
++			break;
++		}
++
++		case kMsgResetStatus:
++			_ShowStatusLine();
++			break;
++
++		case kMsgPhotoWritten:
++		{
++			int32 status = B_ERROR;
++			const char* name = "";
++			message->FindInt32("status", &status);
++			message->FindString("name", &name);
++			_ReportPhoto(status, name);
++			break;
++		}
++
++		case B_KEY_DOWN:
++		{
++			const char* bytes;
++			if (message->FindString("bytes", &bytes) == B_OK
++				&& bytes[0] == B_SPACE) {
++				_Shutter();
++				break;
++			}
++			BWindow::MessageReceived(message);
++			break;
++		}
++
++		default:
++			BWindow::MessageReceived(message);
++			break;
++	}
++}
++
++
++void
++FlickWindow::_BuildMenus(BMenu* bar)
++{
++	BMenu* fileMenu = new BMenu(B_TRANSLATE("File"));
++	BMenuItem* about = new BMenuItem(B_TRANSLATE("About Flick" B_UTF8_ELLIPSIS),
++		new BMessage(B_ABOUT_REQUESTED));
++	about->SetTarget(be_app);
++	fileMenu->AddItem(about);
++	fileMenu->AddSeparatorItem();
++	fileMenu->AddItem(new BMenuItem(B_TRANSLATE("Take photo"),
++		new BMessage(kMsgShutter), 'S'));
++	fSelfTimerItem = new BMenuItem(B_TRANSLATE("Self-timer"),
++		new BMessage(kMsgSelfTimer), 'T');
++	fileMenu->AddItem(fSelfTimerItem);
++	fileMenu->AddSeparatorItem();
++	fileMenu->AddItem(new BMenuItem(B_TRANSLATE("Quit"),
++		new BMessage(B_QUIT_REQUESTED), 'Q'));
++	bar->AddItem(fileMenu);
++
++	fCameraMenu = new BMenu(B_TRANSLATE("Camera"));
++	fCameraMenu->SetRadioMode(true);
++	bar->AddItem(fCameraMenu);
++
++	fSizeMenu = new BMenu(B_TRANSLATE("Size"));
++	fSizeMenu->SetRadioMode(true);
++	bar->AddItem(fSizeMenu);
++
++	BMenu* viewMenu = new BMenu(B_TRANSLATE("View"));
++	viewMenu->AddItem(new BMenuItem(B_TRANSLATE("Image settings" B_UTF8_ELLIPSIS),
++		new BMessage(kMsgShowControls), 'I'));
++	fMirrorItem = new BMenuItem(B_TRANSLATE("Mirror picture"),
++		new BMessage(kMsgMirror), 'M');
++	fMirrorItem->SetMarked(fMirrored);
++	viewMenu->AddItem(fMirrorItem);
++	viewMenu->AddItem(new BMenuItem(B_TRANSLATE("Show frame rate"),
++		new BMessage(kMsgToggleRate), 'R'));
++	bar->AddItem(viewMenu);
++}
++
++
++/*!	The bar below the picture: the camera and its size on the left, the
++	shutter in the middle, the switches on the right. Both sides have the same
++	weight, so the shutter stays in the middle of the window.
++*/
++BView*
++FlickWindow::_BuildBar()
++{
++	fCameraPopUp = new BPopUpMenu(B_TRANSLATE("No camera"));
++	BMenuField* cameraField = new BMenuField("camera", NULL, fCameraPopUp);
++
++	fStatus = new BStringView("status", "");
++	fStatus->SetExplicitMinSize(BSize(120, B_SIZE_UNSET));
++	fShutter = new ShutterButton(new BMessage(kMsgShutter));
++
++	fSelfTimerButton = _CreateToggle("self timer", FLICK_ICON_SELF_TIMER,
++		kMsgSelfTimer, B_TRANSLATE("Self-timer: 3 seconds (Alt-T)"));
++	fMirrorButton = _CreateToggle("mirror", FLICK_ICON_MIRROR, kMsgMirror,
++		B_TRANSLATE("Mirror the picture (Alt-M)"));
++	fMirrorButton->SetValue(fMirrored ? B_CONTROL_ON : B_CONTROL_OFF);
++	BButton* settings = _CreateToggle("settings", FLICK_ICON_SETTINGS,
++		kMsgShowControls, B_TRANSLATE("Image settings (Alt-I)"));
++	settings->SetBehavior(BButton::B_BUTTON_BEHAVIOR);
++
++	BView* bar = new BView("bar", 0);
++	BLayoutBuilder::Group<>(bar, B_HORIZONTAL, B_USE_DEFAULT_SPACING)
++		.SetInsets(B_USE_WINDOW_INSETS, B_USE_HALF_ITEM_INSETS)
++		.AddGroup(B_VERTICAL, 0, 1.0f)
++			.Add(cameraField)
++			.AddGroup(B_HORIZONTAL, 0)
++				.AddStrut(be_control_look->DefaultLabelSpacing())
++				.Add(fStatus)
++				.AddGlue()
++			.End()
++		.End()
++		.Add(fShutter)
++		.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING, 1.0f)
++			.AddGlue()
++			.Add(fSelfTimerButton)
++			.Add(fMirrorButton)
++			.Add(settings)
++		.End();
++	return bar;
++}
++
++
++//!	A flat button with an icon that stays pressed while its switch is on.
++BButton*
++FlickWindow::_CreateToggle(const char* name, flick_icon icon, uint32 what,
++	const char* toolTip)
++{
++	BButton* button = new BButton(name, NULL, new BMessage(what));
++	button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
++	button->SetFlat(true);
++	button->SetToolTip(toolTip);
++	// Keyboard focus belongs to the window, Space takes the photo.
++	button->SetFlags(button->Flags() & ~B_NAVIGABLE);
++
++	float size = roundf(be_plain_font->Size() * 20 / 12);
++	BBitmap* bitmap = flick_create_icon(icon, size);
++	if (bitmap != NULL) {
++		button->SetIcon(bitmap);
++		delete bitmap;
++	}
++	return button;
++}
++
++
++void
++FlickWindow::_FindCameras()
++{
++	FlickCamera::List(fCameras);
++
++	if (fCameras.empty()) {
++		_ShowPlaceholder(true, B_TRANSLATE("No camera found"),
++			B_TRANSLATE("Connect a camera and start Flick again."));
++		fShutter->SetEnabled(false);
++		return;
++	}
++
++	for (size_t i = 0; i < fCameras.size(); i++) {
++		BMessage* message = new BMessage(kMsgCamera);
++		message->AddInt32("index", (int32)i);
++		fCameraMenu->AddItem(new BMenuItem(fCameras[i].name, message));
++		fCameraPopUp->AddItem(new BMenuItem(fCameras[i].name,
++			new BMessage(*message)));
++	}
++
++	_SelectCamera(0);
++}
++
++
++void
++FlickWindow::_SelectCamera(int32 index)
++{
++	if (index < 0 || index >= (int32)fCameras.size())
++		return;
++
++	_StopCountdown();
++	_CloseControls();
++	fCurrentCamera = index;
++	if (BMenuItem* item = fCameraMenu->ItemAt(index))
++		item->SetMarked(true);
++	if (BMenuItem* item = fCameraPopUp->ItemAt(index))
++		item->SetMarked(true);
++
++	_ShowPlaceholder(false,
++		B_TRANSLATE("Opening the camera" B_UTF8_ELLIPSIS), "");
++	UpdateIfNeeded();
++
++	status_t status = fCamera->Open(fCameras[index]);
++	if (status != B_OK) {
++		_ShowPlaceholder(true, B_TRANSLATE("The camera cannot be opened"),
++			B_TRANSLATE("Is another program using it?"));
++		fShutter->SetEnabled(false);
++		return;
++	}
++
++	fSizeCount = fCamera->FindSizes(fSizes, kMaxSizes);
++	while (fSizeMenu->CountItems() > 0)
++		delete fSizeMenu->RemoveItem((int32)0);
++
++	for (int i = 0; i < fSizeCount; i++) {
++		char name[kFlickSizeNameLength];
++		flick_size_menu_label(name, sizeof(name), fSizes[i]);
++		// The camera names its formats in English.
++		BString label(name);
++		label.ReplaceFirst("uncompressed", B_TRANSLATE("uncompressed"));
++		BMessage* message = new BMessage(kMsgSize);
++		message->AddInt32("index", i);
++		fSizeMenu->AddItem(new BMenuItem(label.String(), message));
++	}
++
++	int defaultIndex = flick_default_size_index(fSizes, fSizeCount);
++	for (int i = 0; i < fSizeCount; i++) {
++		if (fSizes[i].width == fPreferredWidth
++			&& fSizes[i].height == fPreferredHeight) {
++			defaultIndex = i;
++		}
++	}
++	if (defaultIndex < 0) {
++		_ShowPlaceholder(true, B_TRANSLATE("The camera reports no size"),
++			B_TRANSLATE("Try another camera."));
++		fShutter->SetEnabled(false);
++		return;
++	}
++
++	_SelectSize(defaultIndex);
++}
++
++
++void
++FlickWindow::_ShowControls()
++{
++	if (fControlsWindow != NULL) {
++		fControlsWindow->Activate();
++		return;
++	}
++	if (fCamera == NULL || !fCamera->HasProducer())
++		return;
++
++	FlickControlsWindow* window
++		= new FlickControlsWindow(fCamera->Producer(), BMessenger(this));
++	if (window->InitCheck() != B_OK) {
++		window->Lock();
++		window->Quit();
++		_SetStatus(B_TRANSLATE("This camera has no picture settings"), true);
++		return;
++	}
++
++	fControlsWindow = window;
++	fControlsWindow->Show();
++}
++
++
++//!	The settings belong to the open camera and must go before it does.
++void
++FlickWindow::_CloseControls()
++{
++	if (fControlsWindow == NULL)
++		return;
++
++	fControlsWindow->Lock();
++	fControlsWindow->Quit();
++	fControlsWindow = NULL;
++}
++
++
++void
++FlickWindow::_SelectSize(int32 index)
++{
++	if (index < 0 || index >= fSizeCount)
++		return;
++
++	_StopCountdown();
++	fCurrentSize = index;
++	if (BMenuItem* item = fSizeMenu->ItemAt(index))
++		item->SetMarked(true);
++
++	fRate = -1;
++	flick_rate_start(&fRateMeter, system_time());
++
++	status_t status = fCamera->Start(fSizes[index].width,
++		fSizes[index].height);
++	if (status != B_OK) {
++		_ShowPlaceholder(true, B_TRANSLATE("The camera cannot be started"),
++			B_TRANSLATE("Disconnect the camera and connect it again."));
++		fShutter->SetEnabled(false);
++		return;
++	}
++
++	fView->SetPictureSize(fCamera->Consumer()->Width(),
++		fCamera->Consumer()->Height());
++	_ShowPlaceholder(false,
++		B_TRANSLATE("Waiting for the picture" B_UTF8_ELLIPSIS), "");
++	fShutter->SetEnabled(true);
++	_ShowStatusLine();
++}
++
++
++void
++FlickWindow::_ShowPlaceholder(bool problem, const char* title, const char* hint)
++{
++	fView->SetPlaceholder(problem, title, hint);
++	_SetStatus(title, false);
++}
++
++
++void
++FlickWindow::_ShowStatusLine()
++{
++	if (fCurrentSize < 0 || fCurrentSize >= fSizeCount)
++		return;
++
++	char size[32];
++	flick_size_label(size, sizeof(size), fSizes[fCurrentSize].width,
++		fSizes[fCurrentSize].height);
++
++	// The name of the camera is shown in the menu field above.
++	BString label(size);
++
++	if (fShowRate && fRate >= 0) {
++		BString rate(B_TRANSLATE("%rate% frames/s"));
++		BString number;
++		number << fRate;
++		rate.ReplaceFirst("%rate%", number);
++		label << " · " << rate;
++	}
++	_SetStatus(label.String(), false);
++}
++
++
++void
++FlickWindow::_CountFrame()
++{
++	int rate;
++	if (!flick_rate_add_frame(&fRateMeter, system_time(), &rate))
++		return;
++
++	fRate = rate;
++	// A temporary message such as "Saved: …" stays until it runs out.
++	if (fShowRate && fStatusRunner == NULL)
++		_ShowStatusLine();
++}
++
++
++void
++FlickWindow::_ToggleRate(BMessage* message)
++{
++	fShowRate = !fShowRate;
++
++	BMenuItem* item;
++	if (message->FindPointer("source", (void**)&item) == B_OK)
++		item->SetMarked(fShowRate);
++
++	if (fStatusRunner == NULL)
++		_ShowStatusLine();
++}
++
++
++void
++FlickWindow::_SetStatus(const char* text, bool temporary)
++{
++	fStatus->SetText(text);
++
++	delete fStatusRunner;
++	fStatusRunner = NULL;
++	if (temporary) {
++		fStatusRunner = new BMessageRunner(BMessenger(this),
++			new BMessage(kMsgResetStatus), 3000000, 1);
++	}
++}
++
++
++//!	Takes the photo now, or with the self-timer on, starts or stops it.
++void
++FlickWindow::_Shutter()
++{
++	if (fView->Bitmap() == NULL || !fView->HasPicture())
++		return;
++	if (!fSelfTimer) {
++		_TakePhoto();
++		return;
++	}
++	if (flick_countdown_running(&fCountdown)) {
++		_StopCountdown();
++		return;
++	}
++
++	flick_countdown_start(&fCountdown, kSelfTimerSeconds);
++	fView->SetCountdown(fCountdown.left);
++	fCountdownRunner = new BMessageRunner(BMessenger(this),
++		new BMessage(kMsgCountdownTick), 1000000, kSelfTimerSeconds);
++}
++
++
++void
++FlickWindow::_CountDown()
++{
++	bool due = flick_countdown_tick(&fCountdown);
++	fView->SetCountdown(fCountdown.left);
++	if (!due)
++		return;
++	delete fCountdownRunner;
++	fCountdownRunner = NULL;
++	_TakePhoto();
++}
++
++
++//!	Also when the camera or its size changes: the photo would be another one.
++void
++FlickWindow::_StopCountdown()
++{
++	delete fCountdownRunner;
++	fCountdownRunner = NULL;
++	flick_countdown_stop(&fCountdown);
++	if (fView != NULL)
++		fView->SetCountdown(0);
++}
++
++
++void
++FlickWindow::_ToggleSelfTimer()
++{
++	fSelfTimer = !fSelfTimer;
++	if (!fSelfTimer)
++		_StopCountdown();
++	fSelfTimerItem->SetMarked(fSelfTimer);
++	fSelfTimerButton->SetValue(fSelfTimer ? B_CONTROL_ON : B_CONTROL_OFF);
++}
++
++
++void
++FlickWindow::_ToggleMirror()
++{
++	fMirrored = !fMirrored;
++	fView->SetMirrored(fMirrored);
++	fMirrorItem->SetMarked(fMirrored);
++	fMirrorButton->SetValue(fMirrored ? B_CONTROL_ON : B_CONTROL_OFF);
++}
++
++
++void
++FlickWindow::_TakePhoto()
++{
++	if (fView->Bitmap() == NULL || !fView->HasPicture())
++		return;
++
++	BPath directory;
++	if (find_directory(B_DESKTOP_DIRECTORY, &directory) != B_OK) {
++		_SetStatus(B_TRANSLATE("Desktop not found"), true);
++		return;
++	}
++
++	// The frame is copied, the live picture goes on while it is written.
++	BBitmap* copy = new BBitmap(*fView->Bitmap());
++	if (copy->InitCheck() != B_OK) {
++		delete copy;
++		_SetStatus(B_TRANSLATE("Not enough memory"), true);
++		return;
++	}
++
++	fView->Flash();
++
++	BFile file;
++	char name[B_FILE_NAME_LENGTH];
++	status_t status = B_ERROR;
++	for (int duplicate = 0; duplicate < 100; duplicate++) {
++		flick_photo_file_name(name, sizeof(name), time(NULL), duplicate);
++		BPath path(directory);
++		path.Append(name);
++		status = file.SetTo(path.Path(),
++			B_CREATE_FILE | B_WRITE_ONLY | B_FAIL_IF_EXISTS);
++		if (status != B_FILE_EXISTS)
++			break;
++	}
++
++	if (status != B_OK) {
++		delete copy;
++		_SetStatus(B_TRANSLATE("The photo cannot be saved"), true);
++		return;
++	}
++
++	status = write_png(copy, &file);
++	delete copy;
++	_ReportPhoto(status, name);
++}
++
++
++void
++FlickWindow::_ReportPhoto(status_t status, const char*)
++{
++	if (status != B_OK) {
++		_SetStatus(B_TRANSLATE("The photo cannot be saved"), true);
++		return;
++	}
++
++	// The name would not fit beside the shutter; the file is on the Desktop.
++	_SetStatus(B_TRANSLATE("Photo saved"), true);
++}
+diff --git a/src/apps/flick/FlickWindow.h b/src/apps/flick/FlickWindow.h
+new file mode 100644
+index 0000000000..d6998a6406
+--- /dev/null
++++ b/src/apps/flick/FlickWindow.h
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2026, Michael Spanier.
++ * Distributed under the terms of the MIT License.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef FLICK_WINDOW_H
++#define FLICK_WINDOW_H
++
++
++#include <Window.h>
++
++#include <vector>
++
++#include "FlickCamera.h"
++#include "FlickIcons.h"
++#include "FlickLogic.h"
++
++class BButton;
++class BMenu;
++class BMenuItem;
++class BMessageRunner;
++class BStringView;
++class FlickControlsWindow;
++class FlickView;
++class ShutterButton;
++
++
++typedef std::vector<flick_camera_info> CameraList;
++
++static const int kMaxSizes = 32;
++
++
++class FlickWindow : public BWindow {
++public:
++								FlickWindow(uint32 preferredWidth = 0,
++									uint32 preferredHeight = 0);
++	virtual						~FlickWindow();
++
++	virtual	bool				QuitRequested();
++	virtual	void				MessageReceived(BMessage* message);
++
++private:
++			void				_BuildMenus(BMenu* bar);
++			BButton*			_CreateToggle(const char* name, flick_icon icon,
++									uint32 what, const char* toolTip);
++			BView*				_BuildBar();
++			void				_FindCameras();
++			void				_SelectCamera(int32 index);
++			void				_SelectSize(int32 index);
++			void				_Shutter();
++			void				_CountDown();
++			void				_StopCountdown();
++			void				_TakePhoto();
++			void				_ToggleSelfTimer();
++			void				_ToggleMirror();
++			void				_ReportPhoto(status_t status, const char* name);
++			void				_SetStatus(const char* text, bool temporary);
++			void				_ShowPlaceholder(bool problem, const char* title,
++									const char* hint);
++			void				_ShowStatusLine();
++			void				_CountFrame();
++			void				_ToggleRate(BMessage* message);
++			void				_ShowControls();
++			void				_CloseControls();
++
++			FlickCamera*		fCamera;
++			FlickControlsWindow*	fControlsWindow;
++			FlickView*			fView;
++			BStringView*		fStatus;
++			ShutterButton*		fShutter;
++			BMenu*				fCameraMenu;
++			BMenu*				fCameraPopUp;
++			BButton*			fSelfTimerButton;
++			BButton*			fMirrorButton;
++			BMenuItem*			fSelfTimerItem;
++			BMenuItem*			fMirrorItem;
++			BMenu*				fSizeMenu;
++			CameraList			fCameras;
++			int32				fCurrentCamera;
++			flick_size			fSizes[kMaxSizes];
++			int					fSizeCount;
++			int32				fCurrentSize;
++			uint32				fPreferredWidth;
++			uint32				fPreferredHeight;
++			BMessageRunner*		fStatusRunner;
++			flick_rate_meter	fRateMeter;
++			int					fRate;
++			bool				fShowRate;
++			bool				fSelfTimer;
++			bool				fMirrored;
++			flick_countdown		fCountdown;
++			BMessageRunner*		fCountdownRunner;
++};
++
++
++#endif	// FLICK_WINDOW_H
+diff --git a/src/apps/flick/Jamfile b/src/apps/flick/Jamfile
+new file mode 100644
+index 0000000000..710c605513
+--- /dev/null
++++ b/src/apps/flick/Jamfile
+@@ -0,0 +1,22 @@
++SubDir HAIKU_TOP src apps flick ;
++
++Application Flick :
++	Flick.cpp
++	FlickCamera.cpp
++	FlickControls.cpp
++	FlickIcons.cpp
++	FlickConsumer.cpp
++	FlickLogic.cpp
++	FlickWindow.cpp
++	: be localestub media translation [ TargetLibstdc++ ]
++	: Flick.rdef
++;
++
++DoCatalogs Flick :
++	x-vnd.Flick
++	:
++	Flick.cpp
++	FlickControls.cpp
++	FlickIcons.cpp
++	FlickWindow.cpp
++;
+diff --git a/src/apps/pegel/Jamfile b/src/apps/pegel/Jamfile
+new file mode 100644
+index 0000000000..249d98fc70
+--- /dev/null
++++ b/src/apps/pegel/Jamfile
+@@ -0,0 +1,6 @@
++SubDir HAIKU_TOP src apps pegel ;
++
++Application Pegel :
++	Pegel.cpp
++	: be media [ TargetLibstdc++ ]
++;
+diff --git a/src/apps/pegel/Pegel.cpp b/src/apps/pegel/Pegel.cpp
+new file mode 100644
+index 0000000000..cd9ec33f29
+--- /dev/null
++++ b/src/apps/pegel/Pegel.cpp
+@@ -0,0 +1,1225 @@
++/*
++ * Pegel: zeigt den Pegel eines Audio-Eingangs und stellt Mikrofon-Verstärkung
++ * und Lautsprecher-Lautstärke ein.
++ *
++ * - Eingang: jeder laufende Knoten mit B_PHYSICAL_INPUT und Audio-Ausgang.
++ * - Mikrofon-Regler: ein kontinuierlicher Parameter dieses Knotens (Vorauswahl
++ *   nach Name und Art, im Menü änderbar), dazu dessen Stumm-Schalter.
++ * - Lautsprecher: Hauptlautstärke und Stumm des System-Mixers.
++ *
++ * Gespeichert wird nichts. Werte, die woanders geändert werden, übernimmt die
++ * Anzeige alle halbe Sekunde.
++ */
++
++
++#include <Application.h>
++#include <CheckBox.h>
++#include <GroupView.h>
++#include <Autolock.h>
++#include <LayoutBuilder.h>
++#include <Locker.h>
++#include <MediaDefs.h>
++#include <MediaRecorder.h>
++#include <MediaRoster.h>
++#include <MenuField.h>
++#include <MenuItem.h>
++#include <MessageRunner.h>
++#include <ParameterWeb.h>
++#include <PopUpMenu.h>
++#include <Slider.h>
++#include <String.h>
++#include <StringView.h>
++#include <View.h>
++#include <Window.h>
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++
++static const uint32 kMsgTick = 'tick';
++static const uint32 kMsgInput = 'inpt';
++static const uint32 kMsgMicParameter = 'mprm';
++static const uint32 kMsgMicGain = 'mgai';
++static const uint32 kMsgMicMute = 'mmut';
++static const uint32 kMsgSpeakerGain = 'sgai';
++static const uint32 kMsgSpeakerMute = 'smut';
++static const uint32 kMsgRescan = 'rscn';
++
++static const bigtime_t kTickInterval = 50000;
++static const int32 kNodeCheckTicks = 40;
++	// Alle 2 s nachsehen, ob Knoten gekommen oder gegangen sind.
++static const bigtime_t kServerStartDelay = 3000000;
++	// Der media_addon_server legt seine Knoten erst nach dem media_server an.
++static const int32 kRefreshTicks = 10;
++static const bigtime_t kUserHold = 1000000;
++static const bigtime_t kPeakHold = 1500000;
++static const float kFloorDB = -80.0f;
++static const int32 kMaxChannels = 16;
++static const int32 kMaxMeters = 8;
++
++
++// #pragma mark - Pegelmessung (läuft im Thread des Recorders)
++
++
++struct Accumulator {
++	BLocker		lock;
++	double		sumSquares[kMaxMeters];
++	float		peak[kMaxMeters];
++	double		differenceSquares;
++		// Summe von (links - rechts)^2: zeigt, ob zwei Kanäle verschieden sind
++	int64		frames;
++	int32		channels;
++	int32		buffers;
++
++	Accumulator() { Reset(); }
++
++	void Reset()
++	{
++		for (int32 c = 0; c < kMaxMeters; c++) {
++			sumSquares[c] = 0;
++			peak[c] = 0;
++		}
++		differenceSquares = 0;
++		frames = 0;
++		channels = 0;
++		buffers = 0;
++	}
++};
++
++
++static float
++normalized_sample(const void* data, size_t index, uint32 type)
++{
++	switch (type) {
++		case media_raw_audio_format::B_AUDIO_FLOAT:
++			return ((const float*)data)[index];
++		case media_raw_audio_format::B_AUDIO_DOUBLE:
++			return (float)((const double*)data)[index];
++		case media_raw_audio_format::B_AUDIO_INT:
++			return ((const int32*)data)[index] / 2147483648.0f;
++		case media_raw_audio_format::B_AUDIO_SHORT:
++			return ((const int16*)data)[index] / 32768.0f;
++		case media_raw_audio_format::B_AUDIO_CHAR:
++			return ((const int8*)data)[index] / 128.0f;
++		case media_raw_audio_format::B_AUDIO_UCHAR:
++			return (((const uint8*)data)[index] - 128) / 128.0f;
++	}
++	return 0;
++}
++
++
++static size_t
++sample_size(uint32 type)
++{
++	return type & media_raw_audio_format::B_AUDIO_SIZE_MASK;
++}
++
++
++static void
++buffer_hook(void* cookie, bigtime_t /*time*/, void* data, size_t size,
++	const media_format& format)
++{
++	Accumulator* accumulator = (Accumulator*)cookie;
++	uint32 type = format.u.raw_audio.format;
++	size_t bytes = sample_size(type);
++	if (bytes == 0)
++		return;
++
++	int32 channels = format.u.raw_audio.channel_count;
++	if (channels < 1)
++		channels = 1;
++	int32 metered = channels < kMaxMeters ? channels : kMaxMeters;
++	size_t frames = size / bytes / channels;
++
++	double sums[kMaxMeters] = {};
++	float peaks[kMaxMeters] = {};
++	double difference = 0;
++	for (size_t frame = 0; frame < frames; frame++) {
++		size_t first = frame * channels;
++		for (int32 c = 0; c < metered; c++) {
++			float value = normalized_sample(data, first + c, type);
++			sums[c] += (double)value * value;
++			if (fabsf(value) > peaks[c])
++				peaks[c] = fabsf(value);
++		}
++		if (channels >= 2) {
++			float delta = normalized_sample(data, first, type)
++				- normalized_sample(data, first + 1, type);
++			difference += (double)delta * delta;
++		}
++	}
++
++	BAutolock _(accumulator->lock);
++	for (int32 c = 0; c < metered; c++) {
++		accumulator->sumSquares[c] += sums[c];
++		if (peaks[c] > accumulator->peak[c])
++			accumulator->peak[c] = peaks[c];
++	}
++	accumulator->differenceSquares += difference;
++	accumulator->frames += frames;
++	accumulator->channels = channels;
++	accumulator->buffers++;
++}
++
++
++static float
++to_db(float linear)
++{
++	if (linear <= 0)
++		return kFloorDB;
++	float db = 20.0f * log10f(linear);
++	return db < kFloorDB ? kFloorDB : db;
++}
++
++
++// #pragma mark - Pegelbalken
++
++
++class MeterView : public BView {
++public:
++							MeterView(const char* label);
++
++			void			SetLevel(float rmsDB, float peakDB, bool signal);
++
++	virtual	void			Draw(BRect updateRect);
++	virtual	BSize			MinSize();
++
++private:
++			float			_X(float db, BRect bounds) const;
++
++			BString			fLabel;
++			float			fRmsDB;
++			float			fPeakDB;
++			float			fHoldDB;
++			bigtime_t		fHoldTime;
++			bool			fSignal;
++};
++
++
++MeterView::MeterView(const char* label)
++	:
++	BView("meter", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
++	fLabel(label),
++	fRmsDB(kFloorDB),
++	fPeakDB(kFloorDB),
++	fHoldDB(kFloorDB),
++	fHoldTime(0),
++	fSignal(false)
++{
++	SetViewColor(B_TRANSPARENT_COLOR);
++}
++
++
++void
++MeterView::SetLevel(float rmsDB, float peakDB, bool signal)
++{
++	fRmsDB = rmsDB;
++	fPeakDB = peakDB;
++	fSignal = signal;
++	bigtime_t now = system_time();
++	if (peakDB >= fHoldDB || now - fHoldTime > kPeakHold) {
++		fHoldDB = peakDB;
++		fHoldTime = now;
++	}
++	Invalidate();
++}
++
++
++float
++MeterView::_X(float db, BRect bounds) const
++{
++	float fraction = (db - kFloorDB) / -kFloorDB;
++	if (fraction < 0)
++		fraction = 0;
++	if (fraction > 1)
++		fraction = 1;
++	return bounds.left + fraction * bounds.Width();
++}
++
++
++void
++MeterView::Draw(BRect /*updateRect*/)
++{
++	BRect bounds = Bounds();
++	font_height height;
++	GetFontHeight(&height);
++	float textHeight = ceilf(height.ascent + height.descent);
++	BRect bar = bounds;
++	bar.bottom -= textHeight + 4;
++
++	SetHighColor(40, 40, 40);
++	FillRect(bounds);
++
++	// Effektivwert als Balken: grün bis -18 dB, gelb bis -6 dB, dann rot.
++	struct { float from, to; rgb_color color; } zones[] = {
++		{ kFloorDB, -18, { 60, 190, 60, 255 } },
++		{ -18, -6, { 220, 200, 40, 255 } },
++		{ -6, 0, { 220, 60, 50, 255 } },
++	};
++	for (size_t i = 0; i < sizeof(zones) / sizeof(zones[0]); i++) {
++		float top = fRmsDB < zones[i].to ? fRmsDB : zones[i].to;
++		if (top <= zones[i].from)
++			continue;
++		SetHighColor(zones[i].color);
++		FillRect(BRect(_X(zones[i].from, bar), bar.top + 2, _X(top, bar),
++			bar.bottom - 2));
++	}
++
++	// Spitze als dünner Balken darüber, gehaltene Spitze als Strich.
++	SetHighColor(200, 200, 200);
++	FillRect(BRect(bar.left, bar.top + 2, _X(fPeakDB, bar), bar.top + 4));
++	SetHighColor(255, 255, 255);
++	float holdX = _X(fHoldDB, bar);
++	StrokeLine(BPoint(holdX, bar.top), BPoint(holdX, bar.bottom));
++
++	// Skala alle 10 dB.
++	SetHighColor(120, 120, 120);
++	for (float db = kFloorDB; db <= 0; db += 10) {
++		float x = _X(db, bar);
++		StrokeLine(BPoint(x, bar.bottom - 3), BPoint(x, bar.bottom));
++	}
++
++	char text[96];
++	if (fSignal) {
++		snprintf(text, sizeof(text), "%s  Effektiv %.1f dBFS   Spitze %.1f dBFS",
++			fLabel.String(), fRmsDB, fHoldDB);
++	} else
++		snprintf(text, sizeof(text), "%s  kein Signal", fLabel.String());
++	SetHighColor(230, 230, 230);
++	SetLowColor(40, 40, 40);
++	DrawString(text, BPoint(bounds.left + 4, bounds.bottom - height.descent - 2));
++}
++
++
++BSize
++MeterView::MinSize()
++{
++	return BSize(360, 48);
++}
++
++
++// #pragma mark - Regler für einen Parameter
++
++
++/*!	Ein Schieberegler für einen BContinuousParameter. Er rechnet in Zehnteln der
++	Einheit, damit 0,5-dB-Grenzen genau treffen, und rastet beim Verschieben
++	auf ganze dB ein (siehe _Snap()).
++*/
++class ParameterSlider {
++public:
++							ParameterSlider(BSlider* slider, BCheckBox* mute);
++
++			void			Bind(BContinuousParameter* gain,
++								BDiscreteParameter* mute);
++			void			Refresh();
++			void			ApplySlider();
++			void			ApplyMute();
++
++private:
++			float			_Snap(float value) const;
++			void			_UpdateLabel(float value);
++
++			BSlider*		fSlider;
++			BCheckBox*		fMute;
++			BContinuousParameter* fGain;
++			BDiscreteParameter* fMuteParameter;
++			bigtime_t		fLastUserChange;
++};
++
++
++ParameterSlider::ParameterSlider(BSlider* slider, BCheckBox* mute)
++	:
++	fSlider(slider),
++	fMute(mute),
++	fGain(NULL),
++	fMuteParameter(NULL),
++	fLastUserChange(0)
++{
++}
++
++
++void
++ParameterSlider::Bind(BContinuousParameter* gain, BDiscreteParameter* mute)
++{
++	fGain = gain;
++	fMuteParameter = mute;
++	fSlider->SetEnabled(gain != NULL);
++	fMute->SetEnabled(mute != NULL);
++	if (gain != NULL) {
++		fSlider->SetLimits((int32)roundf(gain->MinValue() * 10),
++			(int32)roundf(gain->MaxValue() * 10));
++		char minLabel[32];
++		char maxLabel[32];
++		snprintf(minLabel, sizeof(minLabel), "%g %s", gain->MinValue(),
++			gain->Unit());
++		snprintf(maxLabel, sizeof(maxLabel), "%g %s", gain->MaxValue(),
++			gain->Unit());
++		fSlider->SetLimitLabels(minLabel, maxLabel);
++		fSlider->SetKeyIncrementValue(10);
++			// Pfeiltasten: 1 dB je Druck
++	} else {
++		fSlider->SetLimitLabels("", "");
++		fSlider->SetLabel("(kein Regler)");
++	}
++	fLastUserChange = 0;
++	Refresh();
++}
++
++
++void
++ParameterSlider::Refresh()
++{
++	if (system_time() - fLastUserChange < kUserHold)
++		return;
++
++	if (fGain != NULL) {
++		float values[kMaxChannels];
++		size_t size = sizeof(values);
++		bigtime_t when;
++		if (fGain->GetValue(values, &size, &when) == B_OK
++			&& size >= sizeof(float)) {
++			fSlider->SetValue((int32)roundf(values[0] * 10));
++			_UpdateLabel(values[0]);
++		}
++	}
++	if (fMuteParameter != NULL) {
++		int32 value = 0;
++		size_t size = sizeof(value);
++		bigtime_t when;
++		if (fMuteParameter->GetValue(&value, &size, &when) == B_OK)
++			fMute->SetValue(value != 0 ? B_CONTROL_ON : B_CONTROL_OFF);
++	}
++}
++
++
++void
++ParameterSlider::ApplySlider()
++{
++	if (fGain == NULL)
++		return;
++	fLastUserChange = system_time();
++	float value = _Snap(fSlider->Value() / 10.0f);
++	fSlider->SetValue((int32)roundf(value * 10));
++	int32 channels = fGain->CountChannels();
++	if (channels < 1 || channels > kMaxChannels)
++		channels = 1;
++	float values[kMaxChannels];
++	for (int32 c = 0; c < channels; c++)
++		values[c] = value;
++	fGain->SetValue(values, channels * sizeof(float), system_time());
++	_UpdateLabel(value);
++}
++
++
++void
++ParameterSlider::ApplyMute()
++{
++	if (fMuteParameter == NULL)
++		return;
++	fLastUserChange = system_time();
++	int32 value = fMute->Value() == B_CONTROL_ON ? 1 : 0;
++	fMuteParameter->SetValue(&value, sizeof(value), system_time());
++}
++
++
++/*!	Rundet auf ganze Einheiten (1 dB), damit der Regler einrastet. Gibt der
++	Parameter einen größeren Schritt vor, gilt dieser. Die Grenzen bleiben
++	erreichbar, auch wenn sie keine ganze Zahl sind (zum Beispiel -34,5 dB).
++*/
++float
++ParameterSlider::_Snap(float value) const
++{
++	float step = fGain->ValueStep();
++	if (!(step > 1.0f))
++		step = 1.0f;
++	float snapped = roundf(value / step) * step;
++	if (snapped < fGain->MinValue())
++		snapped = fGain->MinValue();
++	if (snapped > fGain->MaxValue())
++		snapped = fGain->MaxValue();
++	return snapped;
++}
++
++
++void
++ParameterSlider::_UpdateLabel(float value)
++{
++	char label[64];
++	snprintf(label, sizeof(label), "%.1f %s", value, fGain->Unit());
++	fSlider->SetLabel(label);
++}
++
++
++// #pragma mark - Hilfen für Parameter-Netze
++
++
++static BDiscreteParameter*
++mute_in_group(BParameterGroup* group)
++{
++	for (int32 i = 0; i < group->CountParameters(); i++) {
++		BParameter* parameter = group->ParameterAt(i);
++		if (parameter->Type() == BParameter::B_DISCRETE_PARAMETER
++			&& strcmp(parameter->Kind(), B_MUTE) == 0)
++			return (BDiscreteParameter*)parameter;
++	}
++	return NULL;
++}
++
++
++static bool
++contains_word(const char* text, const char* const* words)
++{
++	for (int32 i = 0; words[i] != NULL; i++) {
++		if (strcasestr(text, words[i]) != NULL)
++			return true;
++	}
++	return false;
++}
++
++
++/*!	Ob eine oberste Gruppe zur Wiedergabe gehört. Der HD-Audio-Knoten ist
++	Ein- und Ausgang zugleich; Ausgangsregler gehören nicht ins Menü der
++	Mikrofon-Verstärkung.
++*/
++static bool
++is_output_group(const char* name)
++{
++	static const char* const kOutputWords[] = { "output", "ausgang",
++		"playback", "wiedergabe", NULL };
++	return contains_word(name, kOutputWords);
++}
++
++
++static bool
++is_muted(BDiscreteParameter* mute)
++{
++	if (mute == NULL)
++		return false;
++	int32 value = 0;
++	size_t size = sizeof(value);
++	bigtime_t when;
++	return mute->GetValue(&value, &size, &when) == B_OK && value != 0;
++}
++
++
++//! Bewertet, wie wahrscheinlich ein Regler die Eingangsverstärkung ist.
++static int32
++mic_score(BContinuousParameter* parameter)
++{
++	static const char* const kInputWords[] = { "mic", "eingang", "input",
++		"capture", "record", "aufnahme", NULL };
++	int32 score = 0;
++	if (strcmp(parameter->Kind(), B_GAIN) == 0
++		|| strcmp(parameter->Kind(), B_MASTER_GAIN) == 0)
++		score += 2;
++	if (strcasecmp(parameter->Unit(), "dB") == 0)
++		score += 1;
++	if (contains_word(parameter->Group()->Name(), kInputWords)
++		|| contains_word(parameter->Name(), kInputWords))
++		score += 4;
++	return score;
++}
++
++
++static BContinuousParameter*
++mixer_master_gain(BParameterWeb* web)
++{
++	BContinuousParameter* first = NULL;
++	for (int32 i = 0; i < web->CountParameters(); i++) {
++		BParameter* parameter = web->ParameterAt(i);
++		if (parameter->Type() != BParameter::B_CONTINUOUS_PARAMETER)
++			continue;
++		if (strcmp(parameter->Kind(), B_MASTER_GAIN) == 0)
++			return (BContinuousParameter*)parameter;
++		if (first == NULL)
++			first = (BContinuousParameter*)parameter;
++	}
++	return first;
++}
++
++
++// #pragma mark - Fenster
++
++
++class PegelWindow : public BWindow {
++public:
++							PegelWindow();
++	virtual					~PegelWindow();
++
++	virtual	void			MessageReceived(BMessage* message);
++	virtual	bool			QuitRequested();
++
++private:
++			void			_StartWatching();
++			void			_ScheduleRescan(bigtime_t delay);
++			void			_Rescan();
++			void			_ServerQuit();
++			void			_FindInputs(const char* preferredName);
++			bool			_HasAudioOutput(const media_node& node);
++			bool			_NodesChanged();
++			void			_SelectInput(int32 index);
++			void			_StopRecorder();
++			void			_FillMicParameters();
++			void			_CollectMicParameters(BParameterGroup* group);
++			void			_SelectMicParameter(int32 index);
++			void			_SetupSpeaker();
++			void			_Tick();
++			void			_ShowStereoDifference();
++
++			BMediaRoster*	fRoster;
++			BMenuField*		fInputField;
++			BMenuField*		fMicParameterField;
++			BStringView*	fFormatView;
++			MeterView*		fMeters[kMaxMeters];
++			int32			fShownMeters;
++			BStringView*	fStereoView;
++			double			fDifferenceSum;
++			double			fLevelSum;
++			BSlider*		fMicSlider;
++			BCheckBox*		fMicMute;
++			BSlider*		fSpeakerSlider;
++			BCheckBox*		fSpeakerMute;
++			ParameterSlider	fMic;
++			ParameterSlider	fSpeaker;
++
++			live_node_info	fInputs[32];
++			int32			fInputCount;
++			media_node		fCurrentNode;
++			BMediaRecorder*	fRecorder;
++			BParameterWeb*	fInputWeb;
++			BParameterWeb*	fMixerWeb;
++			BContinuousParameter* fMicCandidates[64];
++			int32			fMicCandidateCount;
++			Accumulator		fAccumulator;
++			BMessageRunner*	fTicker;
++			BMessageRunner*	fRescanRunner;
++			BString			fCurrentName;
++			uint32			fNodeSignature;
++			int32			fTickCount;
++			int32			fQuietTicks;
++};
++
++
++PegelWindow::PegelWindow()
++	:
++	BWindow(BRect(100, 100, 560, 400), "Pegel", B_TITLED_WINDOW,
++		B_AUTO_UPDATE_SIZE_LIMITS | B_QUIT_ON_WINDOW_CLOSE | B_NOT_ZOOMABLE),
++	fRoster(BMediaRoster::Roster()),
++	fMicSlider(new BSlider("mic", "", new BMessage(kMsgMicGain), 0, 1,
++		B_HORIZONTAL)),
++	fMicMute(new BCheckBox("micMute", "Stumm", new BMessage(kMsgMicMute))),
++	fSpeakerSlider(new BSlider("speaker", "", new BMessage(kMsgSpeakerGain),
++		0, 1, B_HORIZONTAL)),
++	fSpeakerMute(new BCheckBox("speakerMute", "Stumm",
++		new BMessage(kMsgSpeakerMute))),
++	fMic(fMicSlider, fMicMute),
++	fSpeaker(fSpeakerSlider, fSpeakerMute),
++	fInputCount(0),
++	fRecorder(NULL),
++	fInputWeb(NULL),
++	fMixerWeb(NULL),
++	fMicCandidateCount(0),
++	fTicker(NULL),
++	fRescanRunner(NULL),
++	fNodeSignature(0),
++	fTickCount(0),
++	fQuietTicks(0)
++{
++	fMicSlider->SetModificationMessage(new BMessage(kMsgMicGain));
++	fSpeakerSlider->SetModificationMessage(new BMessage(kMsgSpeakerGain));
++
++	fInputField = new BMenuField("input", "Eingang:",
++		new BPopUpMenu("(keiner)"));
++	fMicParameterField = new BMenuField("micParameter", "Regler:",
++		new BPopUpMenu("(keiner)"));
++	fFormatView = new BStringView("format", "");
++	// Eigene Ansicht als Behälter: Ansichten in einem losen BGroupLayout
++	// werden nie an das Fenster gehängt und bleiben unsichtbar.
++	BGroupView* meters = new BGroupView(B_VERTICAL, 2);
++	for (int32 c = 0; c < kMaxMeters; c++) {
++		char label[16];
++		if (c == 0)
++			strlcpy(label, "L", sizeof(label));
++		else if (c == 1)
++			strlcpy(label, "R", sizeof(label));
++		else
++			snprintf(label, sizeof(label), "%d", (int)c + 1);
++		fMeters[c] = new MeterView(label);
++		meters->GroupLayout()->AddView(fMeters[c]);
++		if (c > 0)
++			fMeters[c]->Hide();
++	}
++	fShownMeters = 1;
++	fStereoView = new BStringView("stereo", "");
++	fDifferenceSum = 0;
++	fLevelSum = 0;
++
++	BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.Add(fInputField)
++		.Add(fFormatView)
++		.Add(meters)
++		.Add(fStereoView)
++		.AddStrut(B_USE_HALF_ITEM_SPACING)
++		.Add(new BStringView("micTitle", "Mikrofon-Verstärkung"))
++		.Add(fMicParameterField)
++		.AddGroup(B_HORIZONTAL)
++			.Add(fMicSlider, 1)
++			.Add(fMicMute)
++		.End()
++		.AddStrut(B_USE_HALF_ITEM_SPACING)
++		.Add(new BStringView("speakerTitle", "Lautsprecher (System-Mixer)"))
++		.AddGroup(B_HORIZONTAL)
++			.Add(fSpeakerSlider, 1)
++			.Add(fSpeakerMute)
++		.End();
++
++	if (fRoster == NULL) {
++		fFormatView->SetText("Media-Dienste laufen nicht.");
++		return;
++	}
++
++	_StartWatching();
++	_SetupSpeaker();
++	_FindInputs(NULL);
++
++	BMessage tick(kMsgTick);
++	fTicker = new BMessageRunner(BMessenger(this), &tick, kTickInterval);
++}
++
++
++PegelWindow::~PegelWindow()
++{
++	delete fTicker;
++	delete fRescanRunner;
++	if (fRoster != NULL)
++		fRoster->StopWatching(BMessenger(this));
++	_StopRecorder();
++	delete fInputWeb;
++	delete fMixerWeb;
++}
++
++
++bool
++PegelWindow::QuitRequested()
++{
++	delete fTicker;
++	fTicker = NULL;
++	_StopRecorder();
++	return true;
++}
++
++
++void
++PegelWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgTick:
++			_Tick();
++			break;
++		case kMsgInput:
++			_SelectInput(message->GetInt32("index", -1));
++			break;
++		case kMsgMicParameter:
++			_SelectMicParameter(message->GetInt32("index", -1));
++			break;
++		case kMsgMicGain:
++			fMic.ApplySlider();
++			break;
++		case kMsgMicMute:
++			fMic.ApplyMute();
++			break;
++		case kMsgSpeakerGain:
++			fSpeaker.ApplySlider();
++			break;
++		case kMsgSpeakerMute:
++			fSpeaker.ApplyMute();
++			break;
++		case kMsgRescan:
++			_Rescan();
++			break;
++		case B_MEDIA_SERVER_QUIT:
++			_ServerQuit();
++			break;
++		case B_MEDIA_SERVER_STARTED:
++			_ScheduleRescan(kServerStartDelay);
++			break;
++		default:
++			BWindow::MessageReceived(message);
++	}
++}
++
++
++void
++PegelWindow::_FindInputs(const char* preferredName)
++{
++	live_node_info nodes[32];
++	int32 count = 32;
++	if (fRoster->GetLiveNodes(nodes, &count) != B_OK)
++		count = 0;
++
++	BMenu* menu = fInputField->Menu();
++	while (BMenuItem* item = menu->RemoveItem((int32)0))
++		delete item;
++	fInputCount = 0;
++
++	int32 preferred = -1;
++	bool preferredIsBuiltIn = false;
++	bool preferredByName = false;
++	for (int32 i = 0; i < count && fInputCount < 32; i++) {
++		if ((nodes[i].node.kind & B_PHYSICAL_INPUT) == 0)
++			continue;
++		if (!_HasAudioOutput(nodes[i].node))
++			continue;
++
++		fInputs[fInputCount] = nodes[i];
++		BMessage* message = new BMessage(kMsgInput);
++		message->AddInt32("index", fInputCount);
++		char label[B_MEDIA_NAME_LENGTH + 16];
++		snprintf(label, sizeof(label), "%s (#%d)", nodes[i].name,
++			(int)nodes[i].node.node);
++		menu->AddItem(new BMenuItem(label, message));
++		// Den bisher gewählten Eingang wiederfinden, sonst das eingebaute
++		// HD Audio nur, wenn es nichts anderes gibt.
++		bool builtIn = strstr(nodes[i].name, "HD Audio") != NULL;
++		bool byName = preferredName != NULL
++			&& strcmp(nodes[i].name, preferredName) == 0;
++		if (!preferredByName && (byName || preferred < 0
++				|| (!builtIn && preferredIsBuiltIn))) {
++			preferred = fInputCount;
++			preferredIsBuiltIn = builtIn;
++			preferredByName = byName;
++		}
++		fInputCount++;
++	}
++
++	if (fInputCount == 0) {
++		_StopRecorder();
++		fCurrentName = "";
++		fFormatView->SetText("Kein Audio-Eingang gefunden.");
++		fMic.Bind(NULL, NULL);
++		return;
++	}
++	menu->ItemAt(preferred)->SetMarked(true);
++	_SelectInput(preferred);
++}
++
++
++void
++PegelWindow::_StartWatching()
++{
++	// Nur Start und Ende der Dienste: die meldet der Roster in dieser App
++	// selbst. Knoten-Meldungen (B_MEDIA_NODE_CREATED/DELETED) verschickt
++	// dagegen der media_server, und zwar unter einer Sperre, die auch sein
++	// Hauptthread braucht. Kam dieses Fenster mit dem Lesen nicht nach, lief
++	// sein Port voll, und der media_server stand still (21.11.2026 im
++	// Belastungstest). Neue Knoten findet _Tick() deshalb durch Nachsehen.
++	BMessenger self(this);
++	fRoster->StartWatching(self, B_MEDIA_SERVER_QUIT);
++	fRoster->StartWatching(self, B_MEDIA_SERVER_STARTED);
++}
++
++
++void
++PegelWindow::_ScheduleRescan(bigtime_t delay)
++{
++	delete fRescanRunner;
++	BMessage rescan(kMsgRescan);
++	fRescanRunner = new BMessageRunner(BMessenger(this), &rescan, delay, 1);
++}
++
++
++/*!	Sucht die Eingänge neu, nachdem Knoten gekommen oder gegangen sind.
++	Läuft der gewählte Eingang noch, bleibt die Aufnahme ungestört.
++*/
++void
++PegelWindow::_Rescan()
++{
++	delete fRescanRunner;
++	fRescanRunner = NULL;
++
++	bool currentAlive = false;
++	live_node_info nodes[32];
++	int32 count = 32;
++	if (fRecorder != NULL && fRoster->GetLiveNodes(nodes, &count) == B_OK) {
++		for (int32 i = 0; i < count; i++) {
++			if (nodes[i].node.node == fCurrentNode.node
++				&& fCurrentName == nodes[i].name)
++				currentAlive = true;
++		}
++	}
++
++	if (currentAlive) {
++		// Nur das Menü auffrischen, ohne die Verbindung anzufassen.
++		BString name = fCurrentName;
++		BMenu* menu = fInputField->Menu();
++		while (BMenuItem* item = menu->RemoveItem((int32)0))
++			delete item;
++		fInputCount = 0;
++		for (int32 i = 0; i < count && fInputCount < 32; i++) {
++			if ((nodes[i].node.kind & B_PHYSICAL_INPUT) == 0
++				|| !_HasAudioOutput(nodes[i].node))
++				continue;
++			fInputs[fInputCount] = nodes[i];
++			BMessage* message = new BMessage(kMsgInput);
++			message->AddInt32("index", fInputCount);
++			char label[B_MEDIA_NAME_LENGTH + 16];
++			snprintf(label, sizeof(label), "%s (#%d)", nodes[i].name,
++				(int)nodes[i].node.node);
++			BMenuItem* item = new BMenuItem(label, message);
++			item->SetMarked(nodes[i].node.node == fCurrentNode.node);
++			menu->AddItem(item);
++			fInputCount++;
++		}
++		return;
++	}
++
++	BString previous = fCurrentName;
++	_StopRecorder();
++	_SetupSpeaker();
++	_FindInputs(previous.Length() > 0 ? previous.String() : NULL);
++}
++
++
++//!	Die Media-Dienste sind weg: alles loslassen, was auf sie zeigt.
++void
++PegelWindow::_ServerQuit()
++{
++	delete fRescanRunner;
++	fRescanRunner = NULL;
++	_StopRecorder();
++	fMic.Bind(NULL, NULL);
++	fSpeaker.Bind(NULL, NULL);
++	delete fInputWeb;
++	fInputWeb = NULL;
++	delete fMixerWeb;
++	fMixerWeb = NULL;
++	BMenu* menu = fMicParameterField->Menu();
++	while (BMenuItem* item = menu->RemoveItem((int32)0))
++		delete item;
++	fMicCandidateCount = 0;
++	fMicParameterField->Menu()->Superitem()->SetLabel("(keiner)");
++	fFormatView->SetText("Media-Dienste beendet, warte auf Neustart …");
++	fDifferenceSum = 0;
++	fLevelSum = 0;
++	fStereoView->SetText("");
++	for (int32 c = 0; c < fShownMeters; c++)
++		fMeters[c]->SetLevel(kFloorDB, kFloorDB, false);
++}
++
++
++//!	Ob sich die Liste der laufenden Knoten seit dem letzten Blick geändert hat.
++bool
++PegelWindow::_NodesChanged()
++{
++	live_node_info nodes[32];
++	int32 count = 32;
++	if (fRoster->GetLiveNodes(nodes, &count) != B_OK)
++		return false;
++	uint32 signature = count;
++	for (int32 i = 0; i < count; i++)
++		signature = signature * 31 + nodes[i].node.node;
++	if (signature == fNodeSignature)
++		return false;
++	bool first = fNodeSignature == 0;
++	fNodeSignature = signature;
++	return !first;
++}
++
++
++/*!	Ob ein Knoten Audio liefert. Belegte Ausgänge zählen mit: hängt Pegel
++	selbst (oder eine andere App) schon dran, soll er im Menü bleiben.
++*/
++bool
++PegelWindow::_HasAudioOutput(const media_node& node)
++{
++	media_output outputs[16];
++	int32 count = 0;
++	if (fRoster->GetAllOutputsFor(node, outputs, 16, &count) != B_OK)
++		return false;
++	for (int32 i = 0; i < count; i++) {
++		if (outputs[i].format.type == B_MEDIA_RAW_AUDIO)
++			return true;
++	}
++	return false;
++}
++
++
++void
++PegelWindow::_StopRecorder()
++{
++	if (fRecorder == NULL)
++		return;
++	fRecorder->Stop();
++	fRecorder->Disconnect();
++	delete fRecorder;
++	fRecorder = NULL;
++}
++
++
++void
++PegelWindow::_SelectInput(int32 index)
++{
++	if (index < 0 || index >= fInputCount)
++		return;
++
++	_StopRecorder();
++	fMic.Bind(NULL, NULL);
++	delete fInputWeb;
++	fInputWeb = NULL;
++	fCurrentNode = fInputs[index].node;
++	fCurrentName = fInputs[index].name;
++
++	{
++		BAutolock _(fAccumulator.lock);
++		fAccumulator.Reset();
++	}
++
++	fRecorder = new BMediaRecorder("Pegel", B_MEDIA_RAW_AUDIO);
++	status_t status = fRecorder->InitCheck();
++	if (status == B_OK) {
++		fRecorder->SetHooks(buffer_hook, NULL, &fAccumulator);
++		media_format format;
++		format.type = B_MEDIA_RAW_AUDIO;
++		format.u.raw_audio = media_raw_audio_format::wildcard;
++		status = fRecorder->Connect(fCurrentNode, NULL, &format);
++	}
++	if (status == B_OK)
++		status = fRecorder->Start();
++
++	char text[128];
++	if (status == B_OK) {
++		const media_raw_audio_format& audio = fRecorder->Format().u.raw_audio;
++		snprintf(text, sizeof(text), "%.0f Hz, %d %s, %d Bit",
++			audio.frame_rate, (int)audio.channel_count,
++			audio.channel_count == 1 ? "Kanal" : "Kanäle",
++			(int)(sample_size(audio.format) * 8));
++	} else {
++		snprintf(text, sizeof(text), "Aufnahme nicht möglich: %s",
++			strerror(status));
++		_StopRecorder();
++	}
++	fFormatView->SetText(text);
++	fDifferenceSum = 0;
++	fLevelSum = 0;
++	fStereoView->SetText("");
++
++	if (fRoster->GetParameterWebFor(fCurrentNode, &fInputWeb) != B_OK)
++		fInputWeb = NULL;
++	_FillMicParameters();
++}
++
++
++void
++PegelWindow::_FillMicParameters()
++{
++	BMenu* menu = fMicParameterField->Menu();
++	while (BMenuItem* item = menu->RemoveItem((int32)0))
++		delete item;
++	fMicCandidateCount = 0;
++
++	if (fInputWeb != NULL) {
++		for (int32 i = 0; i < fInputWeb->CountGroups(); i++) {
++			BParameterGroup* group = fInputWeb->GroupAt(i);
++			if (!is_output_group(group->Name()))
++				_CollectMicParameters(group);
++		}
++	}
++
++	int32 best = -1;
++	int32 bestScore = -1;
++	for (int32 i = 0; i < fMicCandidateCount; i++) {
++		BContinuousParameter* gain = fMicCandidates[i];
++		int32 score = mic_score(gain);
++		if (is_muted(mute_in_group(gain->Group())))
++			score -= 8;
++		if (score > bestScore) {
++			bestScore = score;
++			best = i;
++		}
++
++		char label[160];
++		const char* name = gain->Name();
++		snprintf(label, sizeof(label), "%s%s%s  [%g … %g %s]",
++			gain->Group()->Name(), name[0] != '\0' ? " / " : "", name,
++			gain->MinValue(), gain->MaxValue(), gain->Unit());
++		BMessage* message = new BMessage(kMsgMicParameter);
++		message->AddInt32("index", i);
++		menu->AddItem(new BMenuItem(label, message));
++	}
++
++	if (best < 0) {
++		fMic.Bind(NULL, NULL);
++		return;
++	}
++	menu->ItemAt(best)->SetMarked(true);
++	_SelectMicParameter(best);
++}
++
++
++//! Sammelt die stufenlosen Regler einer Gruppe samt Untergruppen.
++void
++PegelWindow::_CollectMicParameters(BParameterGroup* group)
++{
++	for (int32 i = 0; i < group->CountParameters()
++			&& fMicCandidateCount < 64; i++) {
++		BParameter* parameter = group->ParameterAt(i);
++		if (parameter->Type() == BParameter::B_CONTINUOUS_PARAMETER) {
++			fMicCandidates[fMicCandidateCount++]
++				= (BContinuousParameter*)parameter;
++		}
++	}
++	for (int32 i = 0; i < group->CountGroups(); i++)
++		_CollectMicParameters(group->GroupAt(i));
++}
++
++
++void
++PegelWindow::_SelectMicParameter(int32 index)
++{
++	if (index < 0 || index >= fMicCandidateCount)
++		return;
++	BContinuousParameter* gain = fMicCandidates[index];
++	fMic.Bind(gain, mute_in_group(gain->Group()));
++}
++
++
++void
++PegelWindow::_SetupSpeaker()
++{
++	fSpeaker.Bind(NULL, NULL);
++	delete fMixerWeb;
++	fMixerWeb = NULL;
++
++	media_node mixer;
++	BContinuousParameter* gain = NULL;
++	BDiscreteParameter* mute = NULL;
++	if (fRoster->GetAudioMixer(&mixer) == B_OK
++		&& fRoster->GetParameterWebFor(mixer, &fMixerWeb) == B_OK) {
++		gain = mixer_master_gain(fMixerWeb);
++		if (gain != NULL)
++			mute = mute_in_group(gain->Group());
++		fRoster->ReleaseNode(mixer);
++	}
++	fSpeaker.Bind(gain, mute);
++}
++
++
++void
++PegelWindow::_Tick()
++{
++	Accumulator snapshot;
++	{
++		BAutolock _(fAccumulator.lock);
++		memcpy(snapshot.sumSquares, fAccumulator.sumSquares,
++			sizeof(snapshot.sumSquares));
++		memcpy(snapshot.peak, fAccumulator.peak, sizeof(snapshot.peak));
++		snapshot.differenceSquares = fAccumulator.differenceSquares;
++		snapshot.frames = fAccumulator.frames;
++		snapshot.channels = fAccumulator.channels;
++		snapshot.buffers = fAccumulator.buffers;
++		int32 channels = fAccumulator.channels;
++		fAccumulator.Reset();
++		fAccumulator.channels = channels;
++	}
++
++	if (fRecorder == NULL) {
++		// Reste aus der Zeit vor dem Trennen gehören zu keinem Eingang mehr.
++		snapshot.frames = 0;
++		snapshot.buffers = 0;
++		snapshot.channels = 0;
++	}
++
++	if (snapshot.buffers > 0)
++		fQuietTicks = 0;
++	else
++		fQuietTicks++;
++
++	int32 wanted = snapshot.channels < 1 ? 1
++		: snapshot.channels < kMaxMeters ? snapshot.channels : kMaxMeters;
++	if (snapshot.channels > 0 && wanted != fShownMeters) {
++		for (int32 c = 0; c < kMaxMeters; c++) {
++			if (c < wanted && fMeters[c]->IsHidden())
++				fMeters[c]->Show();
++			else if (c >= wanted && !fMeters[c]->IsHidden())
++				fMeters[c]->Hide();
++		}
++		fShownMeters = wanted;
++	}
++
++	// Puffer kommen seltener als die Anzeige: ohne neue Daten Wert halten,
++	// erst nach einer Sekunde ohne Puffer "kein Signal".
++	if (snapshot.frames > 0) {
++		for (int32 c = 0; c < fShownMeters; c++) {
++			fMeters[c]->SetLevel(
++				to_db(sqrtf(snapshot.sumSquares[c] / snapshot.frames)),
++				to_db(snapshot.peak[c]), true);
++		}
++		if (snapshot.channels >= 2) {
++			fDifferenceSum += snapshot.differenceSquares;
++			fLevelSum += (snapshot.sumSquares[0] + snapshot.sumSquares[1]) / 2;
++		}
++	} else if (fQuietTicks * kTickInterval > 1000000) {
++		for (int32 c = 0; c < fShownMeters; c++)
++			fMeters[c]->SetLevel(kFloorDB, kFloorDB, false);
++	}
++
++	if (fTickCount % kNodeCheckTicks == 0 && fRoster != NULL
++		&& fRescanRunner == NULL && _NodesChanged())
++		_Rescan();
++
++	if (++fTickCount % kRefreshTicks == 0) {
++		fMic.Refresh();
++		fSpeaker.Refresh();
++		_ShowStereoDifference();
++	}
++}
++
++
++/*!	Zeigt, wie verschieden L und R sind: Energie von (L - R) gegen den
++	mittleren Pegel, über die letzten Sekunden. Zwei echte Mikrofone liegen
++	einige dB darunter; ein doppelt geschickter Mono-Kanal ergibt exakt 0.
++*/
++void
++PegelWindow::_ShowStereoDifference()
++{
++	if (fShownMeters < 2) {
++		fStereoView->SetText("");
++		return;
++	}
++	if (fLevelSum <= 0)
++		return;
++
++	char text[128];
++	if (fDifferenceSum <= 0) {
++		strlcpy(text, "L und R sind identisch (Mono auf zwei Kanälen)",
++			sizeof(text));
++	} else {
++		// 0 dB oder mehr: L und R haben nichts gemeinsam (zwei Mikrofone in
++		// einem leisen Raum rauschen unabhängig). Je tiefer, desto ähnlicher.
++		float db = 10.0f * log10f(fDifferenceSum / fLevelSum);
++		const char* verdict = db > -3 ? "unabhängig"
++			: db > -20 ? "verschieden" : "fast gleich";
++		snprintf(text, sizeof(text), "L–R-Unterschied: %+.1f dB zum Pegel "
++			"(%s)", db, verdict);
++	}
++	fStereoView->SetText(text);
++
++	// Gleitend: ältere Sekunden zählen immer weniger.
++	fDifferenceSum *= 0.7;
++	fLevelSum *= 0.7;
++}
++
++
++// #pragma mark -
++
++
++int
++main()
++{
++	BApplication app("application/x-vnd.RenkuOS-Pegel");
++	(new PegelWindow())->Show();
++	app.Run();
++	return 0;
++}
+-- 
+2.54.1
+

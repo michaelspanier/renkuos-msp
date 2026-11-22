@@ -28,7 +28,7 @@ Patches: [`patches/build00096-msp2/`](patches/build00096-msp2), apply in order w
 | 20 | wlan, usb_webcam: no debug output in normal use (atomozero) | [#544](https://github.com/RenkuOS/Source/pull/544) |
 | 21–25 | usb_audio, hda, multi_audio, media_server, libmedia: audio fixes | not yet submitted |
 | 26 | boot/efi: give the loader a 16 MB heap (needed to list a second system volume) | not yet submitted |
-| 27 | apps: add Flick (webcam viewer) and Pegel (audio level meter) | own apps, will move to HaikuPorts |
+| 27 | apps: add [Flick](https://github.com/michaelspanier/flick) (webcam viewer) and Pegel (audio level meter) | own apps, will move to HaikuPorts |
 | 28–32 | net80211: roaming with hysteresis, keep the link up while roaming within the ESS | not yet submitted |
 | 33 | net80211: do not scan when the scan results are read | [#584](https://github.com/RenkuOS/Source/pull/584) |
 | 34 | boot/loader: prefer a volume marked as the default | not yet submitted |
